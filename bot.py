@@ -15,7 +15,9 @@ TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
 
+bot = Bot(token=TOKEN)
 dp = Dispatcher()
+
 
 location_keyboard = ReplyKeyboardMarkup(
     keyboard=[
@@ -26,7 +28,9 @@ location_keyboard = ReplyKeyboardMarkup(
             )
         ],
         [
-            KeyboardButton(text="✏️ Ввести адресу вручну")
+            KeyboardButton(
+                text="✏️ Ввести адресу вручну"
+            )
         ],
     ],
     resize_keyboard=True,
@@ -34,7 +38,7 @@ location_keyboard = ReplyKeyboardMarkup(
 
 
 @dp.message(CommandStart())
-async def start(message: Message):
+async def start_handler(message: Message):
     await message.answer(
         "👋 Привіт! Я — «Мені туди».\n\n"
         "Допоможу знайти зручний громадський транспорт "
@@ -45,33 +49,44 @@ async def start(message: Message):
     )
 
 
-@dp.message(F.text == "✏️ Ввести адресу вручну")
-async def enter_address(message: Message):
-    await message.answer(
-        "📍 Напиши адресу, звідки ти їдеш.\n\n"
-        "Наприклад: Київська 1",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-
-
 @dp.message(F.location)
-async def receive_location(message: Message):
-    latitude = message.location.latitude
-    longitude = message.location.longitude
-
+async def location_handler(message: Message):
     await message.answer(
         "✅ Геолокацію отримано!\n\n"
         "📍 Твоє місцезнаходження збережено.\n\n"
-        "🏁 А тепер напиши, куди тобі потрібно їхати.",
+        "🏁 А тепер напиши, куди тобі потрібно їхати.\n\n"
+        "Наприклад: Південний бульвар 35",
         reply_markup=ReplyKeyboardRemove(),
     )
 
-    print(f"Location: {latitude}, {longitude}")
+
+@dp.message(F.text)
+async def text_handler(message: Message):
+    text = message.text.strip()
+
+    if text == "✏️ Ввести адресу вручну":
+        await message.answer(
+            "📍 Напиши адресу, звідки ти їдеш.\n\n"
+            "Наприклад: Київська 1",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+
+    await message.answer(
+        "✅ Адресу отримано!\n\n"
+        f"🏁 Куди: {text}\n\n"
+        "🔎 Наступним кроком підключимо пошук "
+        "реального маршруту громадським транспортом."
+    )
 
 
 async def main():
-    bot = Bot(token=TOKEN)
-    await dp.start_polling(bot)
+    print("MENI-TUDY BOT STARTED", flush=True)
+
+    await dp.start_polling(
+        bot,
+        allowed_updates=["message"],
+    )
 
 
 if __name__ == "__main__":
