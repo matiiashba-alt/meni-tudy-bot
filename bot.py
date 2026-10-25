@@ -1,6 +1,7 @@
 import asyncio
 import os
 
+import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
 from aiogram.types import (
@@ -18,7 +19,6 @@ if not TOKEN:
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# Тимчасово зберігаємо дані користувачів
 users = {}
 
 
@@ -38,6 +38,63 @@ location_keyboard = ReplyKeyboardMarkup(
     ],
     resize_keyboard=True,
 )
+
+
+async def geocode_address(address: str):
+    """
+    Перетворює адресу в Івано-Франківську на координати.
+    """
+
+    url = "https://nominatim.openstreetmap.org/search"
+
+    params = {
+        "q": f"{address}, Івано-Франківськ, Україна",
+        "format": "jsonv2",
+        "limit": 1,
+        "countrycodes": "ua",
+    }
+
+    headers = {
+        "User-Agent": "MeniTudyTelegramBot/1.0"
+    }
+
+    timeout = aiohttp.ClientTimeout(total=10)
+
+    try:
+        async with aiohttp.ClientSession(
+            timeout=timeout,
+            headers=headers,
+        ) as session:
+            async with session.get(
+                url,
+                params=params,
+            ) as response:
+
+                if response.status != 200:
+                    return None
+
+                data = await response.json()
+
+                if not data:
+                    return None
+
+                result = data[0]
+
+                return {
+                    "latitude": float(result["lat"]),
+                    "longitude": float(result["lon"]),
+                    "display_name": result.get(
+                        "display_name",
+                        address,
+                    ),
+                }
+
+    except Exception as error:
+        print(
+            f"Geocoding error: {error}",
+            flush=True,
+        )
+        return None
 
 
 @dp.message(CommandStart())
@@ -65,8 +122,8 @@ async def location_handler(message: Message):
     users[user_id] = {
         "step": "waiting_destination",
         "origin_type": "location",
-        "latitude": message.location.latitude,
-        "longitude": message.location.longitude,
+        "origin_latitude": message.location.latitude,
+        "origin_longitude": message.location.longitude,
     }
 
     await message.answer(
@@ -82,7 +139,6 @@ async def text_handler(message: Message):
     user_id = message.from_user.id
     text = message.text.strip()
 
-    # Введення початкової адреси вручну
     if text == "✏️ Ввести адресу вручну":
         users[user_id] = {
             "step": "waiting_origin_address"
@@ -95,7 +151,6 @@ async def text_handler(message: Message):
         )
         return
 
-    # Якщо користувач ще не запускав бота
     if user_id not in users:
         await message.answer(
             "Щоб почати пошук маршруту, натисни /start."
@@ -104,21 +159,58 @@ async def text_handler(message: Message):
 
     step = users[user_id].get("step")
 
-    # Отримали адресу старту
+    # Адреса початкової точки
     if step == "waiting_origin_address":
-        users[user_id]["origin_type"] = "address"
-        users[user_id]["origin"] = text
-        users[user_id]["step"] = "waiting_destination"
+
+        await message.answer(
+            "🔎 Шукаю цю адресу..."
+        )
+
+        result = await geocode_address(text)
+
+        if result is None:
+            await message.answer(
+                "❌ Не вдалося знайти цю адресу.\n\n"
+                "Спробуй написати її точніше.\n"
+                "Наприклад: Київська 1"
+            )
+            return
+
+        users[user_id] = {
+            "step": "waiting_destination",
+            "origin_type": "address",
+            "origin": text,
+            "origin_latitude": result["latitude"],
+            "origin_longitude": result["longitude"],
+        }
 
         await message.answer(
             f"✅ Звідки: {text}\n\n"
+            "📍 Адресу знайдено.\n\n"
             "🏁 Тепер напиши адресу, куди тобі потрібно їхати."
         )
         return
 
-    # Отримали пункт призначення
+    # Адреса призначення
     if step == "waiting_destination":
+
+        await message.answer(
+            "🔎 Шукаю адресу призначення..."
+        )
+
+        result = await geocode_address(text)
+
+        if result is None:
+            await message.answer(
+                "❌ Не вдалося знайти адресу призначення.\n\n"
+                "Перевір назву вулиці та номер будинку "
+                "і спробуй ще раз."
+            )
+            return
+
         users[user_id]["destination"] = text
+        users[user_id]["destination_latitude"] = result["latitude"]
+        users[user_id]["destination_longitude"] = result["longitude"]
         users[user_id]["step"] = "done"
 
         if users[user_id]["origin_type"] == "location":
@@ -127,11 +219,14 @@ async def text_handler(message: Message):
             origin = users[user_id]["origin"]
 
         await message.answer(
-            "✅ Маршрут отримано!\n\n"
+            "✅ Обидві точки знайдено!\n\n"
             f"📍 Звідки: {origin}\n"
             f"🏁 Куди: {text}\n\n"
-            "🔎 Тепер можемо шукати громадський транспорт "
-            "між цими двома точками."
+            "🗺 Координати точки призначення:\n"
+            f"{result['latitude']:.6f}, "
+            f"{result['longitude']:.6f}\n\n"
+            "Наступний крок — знайти найближчі "
+            "зупинки громадського транспорту. 🚌"
         )
         return
 
@@ -142,7 +237,10 @@ async def text_handler(message: Message):
 
 
 async def main():
-    print("MENI-TUDY BOT STARTED", flush=True)
+    print(
+        "MENI-TUDY BOT WITH GEOCODING STARTED",
+        flush=True,
+    )
 
     await dp.start_polling(
         bot,
