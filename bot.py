@@ -78,7 +78,10 @@ route_keyboard = ReplyKeyboardMarkup(
         [
             KeyboardButton(
                 text="🛰 Де зараз транспорт?"
-            )
+            ),
+            KeyboardButton(
+                text="🚌 Всі варіанти"
+            ),
         ],
         [
             KeyboardButton(
@@ -288,8 +291,6 @@ async def load_gtfs():
             io.BytesIO(content)
         )
 
-        # ---------------- STOPS ----------------
-
         new_stops = {}
 
         for row in read_csv(
@@ -312,8 +313,6 @@ async def load_gtfs():
                 continue
 
         stops = new_stops
-
-        # ---------------- ROUTES ----------------
 
         new_routes = {}
 
@@ -343,8 +342,6 @@ async def load_gtfs():
 
         routes = new_routes
 
-        # ---------------- TRIPS ----------------
-
         new_trips = {}
 
         for row in read_csv(
@@ -372,10 +369,6 @@ async def load_gtfs():
             }
 
         trips = new_trips
-
-        # ---------------- STOP TIMES ----------------
-        # Тільки stop_sequence + stop_id.
-        # Не тримаємо весь CSV у RAM.
 
         new_sequences = defaultdict(list)
 
@@ -417,8 +410,6 @@ async def load_gtfs():
                         stop_id,
                     )
                 )
-
-        # ---------------- INDEX ----------------
 
         new_stop_to_trips = defaultdict(list)
 
@@ -762,8 +753,6 @@ def find_direct_routes(
 
                 break
 
-    # Прибираємо дублікати однакових варіантів.
-
     best = {}
 
     for item in candidates:
@@ -956,9 +945,6 @@ def estimate_eta_minutes(
     speed,
     stops_before,
 ):
-    # Миттєва швидкість GPS дуже нестабільна.
-    # Використовуємо її лише як допоміжний сигнал.
-
     if speed >= 8:
 
         effective_speed = max(
@@ -986,7 +972,6 @@ def estimate_eta_minutes(
         / meters_per_minute
     )
 
-    # Додатковий час на зупинки/світлофори.
     stop_delay = min(
         4,
         stops_before * 0.35,
@@ -1074,8 +1059,6 @@ def analyze_live_route(
             "index"
         ]
 
-        # Машина вже далі за нашу посадкову
-        # зупинку у цій послідовності.
         if vehicle_position > origin_position:
             continue
 
@@ -1144,11 +1127,6 @@ def analyze_live_route(
 # ==================================================
 
 def destination_walk_penalty(meters):
-    """
-    Довга ходьба ПІСЛЯ транспорту
-    повинна суттєво погіршувати маршрут.
-    """
-
     if meters <= 300:
         return 0
 
@@ -1165,7 +1143,6 @@ def destination_walk_penalty(meters):
             / 40
         )
 
-    # 700+ метрів — вже слабкий варіант.
     return (
         7
         + (meters - 700)
@@ -1194,8 +1171,6 @@ async def build_route_result(
 
     enriched = []
 
-    # Не аналізуємо нескінченну кількість
-    # варіантів на слабкому сервері.
     candidates.sort(
         key=lambda x: x["_base_score"]
     )
@@ -1219,7 +1194,6 @@ async def build_route_result(
             ]["distance"]
         )
 
-        # Орієнтовний час поїздки.
         ride_minutes = max(
             3,
             candidate[
@@ -1245,14 +1219,11 @@ async def build_route_result(
             "route_vehicle_count"
         ] > 0:
 
-            # GPS є, але потрібний напрямок
-            # не підтверджений.
             wait_minutes = 12
             gps_penalty = 7
 
         else:
 
-            # Немає свіжого GPS.
             wait_minutes = 14
             gps_penalty = 10
 
@@ -1271,8 +1242,6 @@ async def build_route_result(
             )
         )
 
-        # Початкова ходьба теж має значення,
-        # але ходьба після виходу важливіша.
         origin_penalty = 0
 
         if (
@@ -1307,8 +1276,6 @@ async def build_route_result(
         candidate["final_score"] = final_score
 
         enriched.append(candidate)
-
-    # Один найкращий варіант на номер маршруту.
 
     best_by_number = {}
 
@@ -1353,12 +1320,6 @@ def leave_advice(
     eta_high,
     walk_minutes,
 ):
-    # Використовуємо нижню межу ETA,
-    # щоб не радити вийти запізно.
-    #
-    # 1 хв запасу для дуже близької зупинки,
-    # 2 хв — для довшої ходьби.
-
     buffer_minutes = (
         1
         if walk_minutes <= 2
@@ -1633,8 +1594,123 @@ def format_route_result(
                 f"{updated_at.strftime('%H:%M:%S')}"
             ),
             "",
-            "Натисни «🛰 Де зараз транспорт?» — "
-            "і я перевірю його ще раз.",
+            "🛰 «Де зараз транспорт?» — "
+            "оновити GPS.\n"
+            "🚌 «Всі варіанти» — "
+            "подивитися всі знайдені прямі маршрути.",
+        ]
+    )
+
+    return "\n".join(lines)
+
+
+# ==================================================
+# ALL ROUTES — NEW
+# ==================================================
+
+def format_all_routes(
+    destination_text,
+    options,
+):
+    lines = [
+        "🚌 ВСІ ВАРІАНТИ",
+        "━━━━━━━━━━━━━━",
+        f"🏁 Куди: {destination_text}",
+        "",
+    ]
+
+    for index, option in enumerate(
+        options,
+        start=1,
+    ):
+        route = option["route"]
+        live = option["live"]
+
+        if index == 1:
+            marker = "⭐"
+        else:
+            marker = f"{index}️⃣" if index <= 9 else "•"
+
+        lines.extend(
+            [
+                (
+                    f"{marker} МАРШРУТ №"
+                    f"{route['number']}"
+                ),
+                (
+                    f"🚶 До посадки: "
+                    f"{round(option['origin']['distance'])} м"
+                ),
+                (
+                    f"🚏 «{option['origin']['name']}»"
+                ),
+                (
+                    f"🚌 Їхати: "
+                    f"{option['stop_count']} "
+                    f"{plural_stops(option['stop_count'])}"
+                ),
+                (
+                    f"🏁 Виходити: "
+                    f"«{option['destination']['name']}»"
+                ),
+                (
+                    f"🚶 Після виходу: "
+                    f"{round(option['destination']['distance'])} м"
+                ),
+            ]
+        )
+
+        vehicle_info = live.get(
+            "best_vehicle"
+        )
+
+        if vehicle_info:
+
+            vehicle = vehicle_info[
+                "vehicle"
+            ]
+
+            lines.extend(
+                [
+                    (
+                        f"🟢 Транспорт наближається: "
+                        f"≈ {vehicle_info['eta_low']}–"
+                        f"{vehicle_info['eta_high']} хв"
+                    ),
+                    (
+                        f"🚍 Машина: "
+                        f"{vehicle['gov_number'] or '—'}"
+                    ),
+                ]
+            )
+
+        elif live[
+            "route_vehicle_count"
+        ] > 0:
+
+            lines.append(
+                "🟡 GPS є, але напрямок "
+                "машини не підтверджений"
+            )
+
+        else:
+
+            lines.append(
+                "⚪ Свіжого GPS зараз немає"
+            )
+
+        lines.append("")
+
+    lines.extend(
+        [
+            "━━━━━━━━━━━━━━",
+            (
+                f"Знайдено прямих варіантів: "
+                f"{len(options)}"
+            ),
+            "",
+            "⭐ Перший — той, який бот "
+            "зараз вважає найкращим.",
         ]
     )
 
@@ -1657,8 +1733,6 @@ async def refresh_saved_route(
 
     vehicles = await get_live_vehicles()
 
-    # Копіювати весь маршрут не потрібно.
-    # Перераховуємо лише live-частину.
     live = analyze_live_route(
         saved,
         vehicles,
@@ -2018,6 +2092,56 @@ async def where_transport_handler(
 
 
 # ==================================================
+# ALL ROUTES BUTTON — NEW
+# ==================================================
+
+@dp.message(
+    F.text == "🚌 Всі варіанти"
+)
+async def all_routes_handler(
+    message: Message
+):
+    user_id = message.from_user.id
+
+    user_data = users.get(user_id)
+
+    if not user_data:
+
+        await message.answer(
+            "Спочатку побудуй маршрут 👇",
+            reply_markup=start_keyboard,
+        )
+        return
+
+    options = user_data.get(
+        "route_options"
+    )
+
+    destination_text = user_data.get(
+        "destination_text",
+        "пункт призначення",
+    )
+
+    if not options:
+
+        await message.answer(
+            "Спочатку потрібно знайти маршрут.",
+            reply_markup=route_keyboard,
+        )
+        return
+
+    text = format_all_routes(
+        destination_text,
+        options,
+    )
+
+    await message.answer(
+        text,
+        reply_markup=route_keyboard,
+    )
+
+
+# ==================================================
 # TEXT
 # ==================================================
 
@@ -2027,8 +2151,6 @@ async def text_handler(
 ):
     user_id = message.from_user.id
     text = message.text.strip()
-
-    # ---------------- NEW ROUTE ----------------
 
     if text == "🧭 Новий маршрут":
 
@@ -2043,8 +2165,6 @@ async def text_handler(
         )
 
         return
-
-    # ---------------- MANUAL ADDRESS ----------------
 
     if text == "🔎 Ввести адресу":
 
@@ -2073,8 +2193,6 @@ async def text_handler(
     step = users[
         user_id
     ].get("step")
-
-    # ---------------- ORIGIN ADDRESS ----------------
 
     if step == "waiting_origin_address":
 
@@ -2129,8 +2247,6 @@ async def text_handler(
             )
 
         return
-
-    # ---------------- DESTINATION ----------------
 
     if step == "waiting_destination":
 
@@ -2196,13 +2312,17 @@ async def text_handler(
         options = result["routes"]
         best = options[0]
 
-        # ------------------------------------------
-        # ЗБЕРІГАЄМО МАРШРУТ
-        # ------------------------------------------
-
         users[user_id][
             "selected_route"
         ] = best
+
+        # НОВЕ:
+        # зберігаємо всі знайдені варіанти,
+        # щоб кнопка "Всі варіанти"
+        # могла показати їх без нового пошуку.
+        users[user_id][
+            "route_options"
+        ] = options
 
         users[user_id][
             "destination_text"
@@ -2227,9 +2347,7 @@ async def text_handler(
         )
 
         await message.answer(
-            "🛰 Хочеш перевірити, "
-            "де транспорт зараз?\n"
-            "Натисни кнопку нижче 👇",
+            "Що хочеш перевірити? 👇",
             reply_markup=route_keyboard,
         )
 
@@ -2247,7 +2365,7 @@ async def text_handler(
 
 async def main():
     print(
-        "MENI-TUDY LIVE REFRESH START",
+        "MENI-TUDY ALL ROUTES START",
         flush=True,
     )
 
