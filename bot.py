@@ -10,8 +10,10 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import aiohttp
+import asyncpg
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
+from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest
 from aiogram.types import (
     KeyboardButton,
     Message,
@@ -33,6 +35,9 @@ dp = Dispatcher()
 
 # Тільки цей Telegram ID має доступ до адмін-панелі
 ADMIN_ID = 1962638884
+DATABASE_URL = os.getenv("DATABASE_URL")
+db_pool = None
+admin_broadcast_drafts = {}
 
 GTFS_URL = "https://city.dozor.tech/iv-frankivsk/gtfs/static.zip"
 DEVICES_URL = "https://city.dozor.tech/ua/iv-frankivsk/devices.json"
@@ -139,6 +144,136 @@ def now():
 
 def is_admin(user_id):
     return user_id == ADMIN_ID
+
+
+async def init_database():
+    global db_pool
+    if not DATABASE_URL:
+        print("WARNING: DATABASE_URL NOT SET", flush=True)
+        return False
+    try:
+        db_pool = await asyncpg.create_pool(
+            DATABASE_URL,
+            min_size=1,
+            max_size=2,
+            command_timeout=10,
+            statement_cache_size=0,
+            ssl="require",
+        )
+        async with db_pool.acquire() as conn:
+            await conn.execute("SELECT 1")
+        print("DATABASE CONNECTED", flush=True)
+        return True
+    except Exception as exc:
+        db_pool = None
+        print(f"DATABASE ERROR: {exc}", flush=True)
+        return False
+
+
+async def track_user(message: Message):
+    if not db_pool or not message.from_user:
+        return
+    user = message.from_user
+    try:
+        await db_pool.execute(
+            """
+            INSERT INTO bot_users (
+                telegram_id, username, first_name, last_name,
+                language_code, first_seen, last_seen, is_blocked
+            )
+            VALUES ($1, $2, $3, $4, $5, now(), now(), false)
+            ON CONFLICT (telegram_id) DO UPDATE SET
+                username = EXCLUDED.username,
+                first_name = EXCLUDED.first_name,
+                last_name = EXCLUDED.last_name,
+                language_code = EXCLUDED.language_code,
+                last_seen = now(),
+                is_blocked = false
+            """,
+            user.id, user.username, user.first_name,
+            user.last_name, user.language_code,
+        )
+    except Exception as exc:
+        print(f"TRACK USER ERROR: {exc}", flush=True)
+
+
+async def log_event(telegram_id, event_type):
+    if not db_pool:
+        return
+    try:
+        await db_pool.execute(
+            "INSERT INTO bot_events (telegram_id, event_type) VALUES ($1, $2)",
+            telegram_id, event_type,
+        )
+    except Exception as exc:
+        print(f"LOG EVENT ERROR: {exc}", flush=True)
+
+
+async def get_admin_stats():
+    if not db_pool:
+        return None
+    try:
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT
+                    (SELECT count(*) FROM bot_users) AS total_users,
+                    (SELECT count(*) FROM bot_users WHERE last_seen >= date_trunc('day', now())) AS active_today,
+                    (SELECT count(*) FROM bot_users WHERE first_seen >= date_trunc('day', now())) AS new_today,
+                    (SELECT count(*) FROM bot_users WHERE first_seen >= now() - interval '7 days') AS new_7,
+                    (SELECT count(*) FROM bot_users WHERE first_seen >= now() - interval '30 days') AS new_30,
+                    (SELECT count(*) FROM bot_events WHERE event_type = 'route_built') AS routes_total,
+                    (SELECT count(*) FROM bot_events WHERE event_type = 'route_built' AND created_at >= date_trunc('day', now())) AS routes_today,
+                    (SELECT count(*) FROM bot_events WHERE event_type = 'live_gps') AS gps_total,
+                    (SELECT count(*) FROM bot_events WHERE event_type = 'all_routes') AS all_routes_total
+            """)
+            return dict(row)
+    except Exception as exc:
+        print(f"STATS ERROR: {exc}", flush=True)
+        return None
+
+
+async def get_recent_users(limit=10):
+    if not db_pool:
+        return []
+    try:
+        return await db_pool.fetch(
+            """
+            SELECT telegram_id, username, first_name, last_name,
+                   first_seen, last_seen, is_blocked
+            FROM bot_users
+            ORDER BY last_seen DESC
+            LIMIT $1
+            """,
+            limit,
+        )
+    except Exception as exc:
+        print(f"USERS ERROR: {exc}", flush=True)
+        return []
+
+
+async def get_broadcast_user_ids():
+    if not db_pool:
+        return []
+    try:
+        rows = await db_pool.fetch(
+            "SELECT telegram_id FROM bot_users WHERE is_blocked = false ORDER BY telegram_id"
+        )
+        return [row["telegram_id"] for row in rows]
+    except Exception as exc:
+        print(f"BROADCAST USERS ERROR: {exc}", flush=True)
+        return []
+
+
+async def mark_user_blocked(telegram_id):
+    if not db_pool:
+        return
+    try:
+        await db_pool.execute(
+            "UPDATE bot_users SET is_blocked = true WHERE telegram_id = $1",
+            telegram_id,
+        )
+    except Exception as exc:
+        print(f"BLOCK USER ERROR: {exc}", flush=True)
 
 
 def distance_meters(lat1, lon1, lat2, lon2):
@@ -2046,75 +2181,126 @@ async def admin_debug_handler(
 
 
 @dp.message(F.text == "📊 Статистика")
-async def admin_statistics_handler(
-    message: Message
-):
-    if not is_admin(
-        message.from_user.id
-    ):
+async def admin_statistics_handler(message: Message):
+    if not is_admin(message.from_user.id):
         return
-
+    stats = await get_admin_stats()
+    if not stats:
+        await message.answer(
+            "📊 СТАТИСТИКА\n━━━━━━━━━━━━━━\n\n"
+            "⚠️ База даних зараз недоступна.\n"
+            "Сам транспортний бот продовжує працювати.",
+            reply_markup=admin_keyboard,
+        )
+        return
     await message.answer(
-        "📊 СТАТИСТИКА\n"
-        "━━━━━━━━━━━━━━\n\n"
-        f"👤 Активних сесій зараз: {len(users)}\n\n"
-        "⚠️ Це поки лише користувачі, "
-        "які знаходяться в оперативній пам'яті бота.\n\n"
-        "Після підключення постійної бази тут будуть:\n"
-        "• усі користувачі\n"
-        "• нові сьогодні\n"
-        "• нові за 7 / 30 днів\n"
-        "• побудовані маршрути\n"
-        "• використання GPS\n"
-        "• використання «Всі варіанти»",
+        "📊 СТАТИСТИКА\n━━━━━━━━━━━━━━\n\n"
+        f"👥 Усього користувачів: {stats['total_users']}\n"
+        f"🟢 Активні сьогодні: {stats['active_today']}\n"
+        f"🆕 Нові сьогодні: {stats['new_today']}\n"
+        f"📅 Нові за 7 днів: {stats['new_7']}\n"
+        f"🗓 Нові за 30 днів: {stats['new_30']}\n\n"
+        f"🧭 Побудовано маршрутів: {stats['routes_total']}\n"
+        f"↳ сьогодні: {stats['routes_today']}\n"
+        f"🛰 Перевірок транспорту: {stats['gps_total']}\n"
+        f"🚌 Натискань «Всі варіанти»: {stats['all_routes_total']}\n\n"
+        f"💾 Сесій у пам'яті зараз: {len(users)}",
         reply_markup=admin_keyboard,
     )
 
 
 @dp.message(F.text == "👥 Користувачі")
-async def admin_users_handler(
-    message: Message
-):
-    if not is_admin(
-        message.from_user.id
-    ):
+async def admin_users_handler(message: Message):
+    if not is_admin(message.from_user.id):
         return
-
-    await message.answer(
-        "👥 КОРИСТУВАЧІ\n"
-        "━━━━━━━━━━━━━━\n\n"
-        f"Зараз у пам'яті: {len(users)}\n\n"
-        "Постійний список ще не підключений.\n\n"
-        "Після підключення бази тут зможемо "
-        "показувати ID, ім'я, username, дату "
-        "реєстрації та останню активність.",
-        reply_markup=admin_keyboard,
-    )
+    rows = await get_recent_users(10)
+    if not db_pool:
+        await message.answer(
+            "👥 КОРИСТУВАЧІ\n━━━━━━━━━━━━━━\n\n⚠️ База даних зараз недоступна.",
+            reply_markup=admin_keyboard,
+        )
+        return
+    if not rows:
+        await message.answer(
+            "👥 КОРИСТУВАЧІ\n━━━━━━━━━━━━━━\n\nПоки база порожня.\n"
+            "Користувачі з'являтимуться тут після взаємодії з оновленим ботом.",
+            reply_markup=admin_keyboard,
+        )
+        return
+    lines = ["👥 КОРИСТУВАЧІ", "━━━━━━━━━━━━━━", "", "Останні 10 за активністю:", ""]
+    for row in rows:
+        name = " ".join(filter(None, [row["first_name"], row["last_name"]])) or "Без імені"
+        username = f"@{row['username']}" if row["username"] else "без username"
+        last_seen = row["last_seen"].astimezone(KYIV_TZ).strftime("%d.%m.%Y %H:%M")
+        blocked = " 🚫" if row["is_blocked"] else ""
+        lines.append(f"• {name}{blocked}\n  {username} · ID {row['telegram_id']}\n  🕒 {last_seen}")
+    await message.answer("\n".join(lines), reply_markup=admin_keyboard)
 
 
 @dp.message(F.text == "📢 Розсилка")
-async def admin_broadcast_handler(
-    message: Message
-):
-    if not is_admin(
-        message.from_user.id
-    ):
+async def admin_broadcast_handler(message: Message):
+    if not is_admin(message.from_user.id):
         return
-
+    if not db_pool:
+        await message.answer(
+            "📢 РОЗСИЛКА\n━━━━━━━━━━━━━━\n\n⚠️ База даних зараз недоступна.",
+            reply_markup=admin_keyboard,
+        )
+        return
+    admin_broadcast_drafts[message.from_user.id] = {"state": "waiting_text"}
     await message.answer(
-        "📢 РОЗСИЛКА\n"
-        "━━━━━━━━━━━━━━\n\n"
-        "Розсилку поки не запускаємо.\n\n"
-        "Спочатку підключимо постійну базу "
-        "користувачів, щоб бот не втрачав "
-        "одержувачів після перезапуску.\n\n"
-        "Після цього тут буде:\n"
-        "✍️ створення повідомлення\n"
-        "👁 попередній перегляд\n"
-        "✅ підтвердження\n"
-        "📨 результат розсилки",
-        reply_markup=admin_keyboard,
+        "📢 РОЗСИЛКА\n━━━━━━━━━━━━━━\n\n"
+        "Напиши текст повідомлення, яке потрібно надіслати користувачам.\n\n"
+        "Я спочатку покажу попередній перегляд — без підтвердження нічого не відправиться.\n\n"
+        "Для скасування напиши: Скасувати",
+        reply_markup=ReplyKeyboardRemove(),
     )
+
+
+@dp.message(F.text == "✅ Надіслати розсилку")
+async def admin_broadcast_confirm_handler(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    draft = admin_broadcast_drafts.get(message.from_user.id)
+    if not draft or draft.get("state") != "confirm" or not draft.get("text"):
+        await message.answer("Немає підготовленої розсилки.", reply_markup=admin_keyboard)
+        return
+    recipient_ids = await get_broadcast_user_ids()
+    if not recipient_ids:
+        admin_broadcast_drafts.pop(message.from_user.id, None)
+        await message.answer("У базі поки немає одержувачів.", reply_markup=admin_keyboard)
+        return
+    status = await message.answer(f"📨 Починаю розсилку для {len(recipient_ids)} користувачів…")
+    sent = 0
+    blocked = 0
+    failed = 0
+    for telegram_id in recipient_ids:
+        try:
+            await bot.send_message(telegram_id, draft["text"])
+            sent += 1
+        except TelegramForbiddenError:
+            blocked += 1
+            await mark_user_blocked(telegram_id)
+        except TelegramBadRequest:
+            failed += 1
+        except Exception as exc:
+            failed += 1
+            print(f"BROADCAST ERROR {telegram_id}: {exc}", flush=True)
+        await asyncio.sleep(0.05)
+    admin_broadcast_drafts.pop(message.from_user.id, None)
+    await status.edit_text(
+        "📨 РОЗСИЛКА ЗАВЕРШЕНА\n━━━━━━━━━━━━━━\n\n"
+        f"✅ Надіслано: {sent}\n🚫 Заблокували бота: {blocked}\n⚠️ Помилок: {failed}"
+    )
+    await message.answer("Адмін-панель 👇", reply_markup=admin_keyboard)
+
+
+@dp.message(F.text == "❌ Скасувати розсилку")
+async def admin_broadcast_cancel_handler(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    admin_broadcast_drafts.pop(message.from_user.id, None)
+    await message.answer("❌ Розсилку скасовано.", reply_markup=admin_keyboard)
 
 
 @dp.message(
@@ -2156,6 +2342,9 @@ async def close_admin_handler(
 async def start_handler(
     message: Message
 ):
+    await track_user(message)
+    await log_event(message.from_user.id, "start")
+
     users[
         message.from_user.id
     ] = {
@@ -2188,6 +2377,7 @@ async def start_handler(
 async def location_handler(
     message: Message
 ):
+    await track_user(message)
     user_id = message.from_user.id
 
     latitude = (
@@ -2246,6 +2436,8 @@ async def location_handler(
 async def where_transport_handler(
     message: Message
 ):
+    await track_user(message)
+    await log_event(message.from_user.id, "live_gps")
     user_id = message.from_user.id
 
     user_data = users.get(user_id)
@@ -2304,6 +2496,8 @@ async def where_transport_handler(
 async def all_routes_handler(
     message: Message
 ):
+    await track_user(message)
+    await log_event(message.from_user.id, "all_routes")
     user_id = message.from_user.id
 
     user_data = users.get(user_id)
@@ -2352,8 +2546,31 @@ async def all_routes_handler(
 async def text_handler(
     message: Message
 ):
+    await track_user(message)
     user_id = message.from_user.id
     text = message.text.strip()
+
+    if is_admin(user_id):
+        draft = admin_broadcast_drafts.get(user_id)
+        if draft and draft.get("state") == "waiting_text":
+            if text.casefold() == "скасувати":
+                admin_broadcast_drafts.pop(user_id, None)
+                await message.answer("❌ Розсилку скасовано.", reply_markup=admin_keyboard)
+                return
+            admin_broadcast_drafts[user_id] = {"state": "confirm", "text": text}
+            confirm_keyboard = ReplyKeyboardMarkup(
+                keyboard=[
+                    [KeyboardButton(text="✅ Надіслати розсилку")],
+                    [KeyboardButton(text="❌ Скасувати розсилку")],
+                ],
+                resize_keyboard=True,
+            )
+            await message.answer(
+                "👁 ПОПЕРЕДНІЙ ПЕРЕГЛЯД\n━━━━━━━━━━━━━━\n\n" + text +
+                "\n\n━━━━━━━━━━━━━━\nНадіслати це всім активним користувачам?",
+                reply_markup=confirm_keyboard,
+            )
+            return
 
     if text == "🧭 Новий маршрут":
 
@@ -2535,6 +2752,8 @@ async def text_handler(
             "step"
         ] = "route_ready"
 
+        await log_event(user_id, "route_built")
+
         formatted = format_route_result(
             text,
             options,
@@ -2568,6 +2787,8 @@ async def main():
         flush=True,
     )
 
+    await init_database()
+
     loaded = await load_gtfs()
 
     if not loaded:
@@ -2582,12 +2803,16 @@ async def main():
         flush=True,
     )
 
-    await dp.start_polling(
-        bot,
-        allowed_updates=[
-            "message"
-        ],
-    )
+    try:
+        await dp.start_polling(
+            bot,
+            allowed_updates=[
+                "message"
+            ],
+        )
+    finally:
+        if db_pool:
+            await db_pool.close()
 
 
 if __name__ == "__main__":
