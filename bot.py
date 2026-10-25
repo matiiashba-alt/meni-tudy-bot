@@ -31,6 +31,9 @@ if not TOKEN:
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
+# Тільки цей Telegram ID має доступ до адмін-панелі
+ADMIN_ID = 1962638884
+
 GTFS_URL = "https://city.dozor.tech/iv-frankivsk/gtfs/static.zip"
 DEVICES_URL = "https://city.dozor.tech/ua/iv-frankivsk/devices.json"
 
@@ -98,6 +101,33 @@ route_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
+admin_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [
+            KeyboardButton(
+                text="📊 Статистика"
+            ),
+            KeyboardButton(
+                text="👥 Користувачі"
+            ),
+        ],
+        [
+            KeyboardButton(
+                text="📢 Розсилка"
+            ),
+            KeyboardButton(
+                text="🔧 Дебаг"
+            ),
+        ],
+        [
+            KeyboardButton(
+                text="❌ Закрити адмін-панель"
+            )
+        ],
+    ],
+    resize_keyboard=True,
+)
+
 
 # ==================================================
 # BASIC HELPERS
@@ -105,6 +135,10 @@ route_keyboard = ReplyKeyboardMarkup(
 
 def now():
     return datetime.now(KYIV_TZ)
+
+
+def is_admin(user_id):
+    return user_id == ADMIN_ID
 
 
 def distance_meters(lat1, lon1, lat2, lon2):
@@ -1605,7 +1639,7 @@ def format_route_result(
 
 
 # ==================================================
-# ALL ROUTES — NEW
+# ALL ROUTES
 # ==================================================
 
 def format_all_routes(
@@ -1927,6 +1961,194 @@ def format_live_refresh(
 
 
 # ==================================================
+# ADMIN
+# ==================================================
+
+async def send_admin_debug(
+    message: Message
+):
+    vehicles = await get_live_vehicles()
+
+    active_route_numbers = {
+        vehicle["route_short_name"]
+        for vehicle in vehicles
+        if vehicle.get("route_short_name")
+    }
+
+    await message.answer(
+        "🔧 ДЕБАГ\n"
+        "━━━━━━━━━━━━━━\n\n"
+        "📦 GTFS\n"
+        f"🚏 Зупинок: {len(stops)}\n"
+        f"🚌 Маршрутів: {len(routes)}\n"
+        f"🚍 Trips: {len(trips)}\n"
+        f"🧭 Послідовностей: {len(trip_sequences)}\n\n"
+        "🛰 REALTIME\n"
+        f"🚍 Свіжих GPS-машин: {len(vehicles)}\n"
+        f"🚌 Маршрутів із GPS: {len(active_route_numbers)}\n"
+        f"⏱ Ліміт свіжості GPS: "
+        f"{MAX_GPS_AGE_SECONDS // 60} хв\n\n"
+        "👤 ПОТОЧНА СЕСІЯ\n"
+        f"Користувачів у пам'яті: {len(users)}\n\n"
+        f"🕒 Перевірено: {now().strftime('%d.%m.%Y %H:%M:%S')}",
+        reply_markup=admin_keyboard,
+    )
+
+
+@dp.message(F.text == "/admin")
+async def admin_handler(
+    message: Message
+):
+    if not is_admin(
+        message.from_user.id
+    ):
+        return
+
+    await message.answer(
+        "🛠 АДМІН-ПАНЕЛЬ\n"
+        "━━━━━━━━━━━━━━\n\n"
+        "Привіт, Богдане 👋\n\n"
+        "📊 Статистика — показники бота\n"
+        "👥 Користувачі — база користувачів\n"
+        "📢 Розсилка — повідомлення користувачам\n"
+        "🔧 Дебаг — стан GTFS та GPS\n\n"
+        "Обери потрібний розділ 👇",
+        reply_markup=admin_keyboard,
+    )
+
+
+@dp.message(F.text == "/debug")
+async def debug_handler(
+    message: Message
+):
+    if not is_admin(
+        message.from_user.id
+    ):
+        return
+
+    await send_admin_debug(
+        message
+    )
+
+
+@dp.message(F.text == "🔧 Дебаг")
+async def admin_debug_handler(
+    message: Message
+):
+    if not is_admin(
+        message.from_user.id
+    ):
+        return
+
+    await send_admin_debug(
+        message
+    )
+
+
+@dp.message(F.text == "📊 Статистика")
+async def admin_statistics_handler(
+    message: Message
+):
+    if not is_admin(
+        message.from_user.id
+    ):
+        return
+
+    await message.answer(
+        "📊 СТАТИСТИКА\n"
+        "━━━━━━━━━━━━━━\n\n"
+        f"👤 Активних сесій зараз: {len(users)}\n\n"
+        "⚠️ Це поки лише користувачі, "
+        "які знаходяться в оперативній пам'яті бота.\n\n"
+        "Після підключення постійної бази тут будуть:\n"
+        "• усі користувачі\n"
+        "• нові сьогодні\n"
+        "• нові за 7 / 30 днів\n"
+        "• побудовані маршрути\n"
+        "• використання GPS\n"
+        "• використання «Всі варіанти»",
+        reply_markup=admin_keyboard,
+    )
+
+
+@dp.message(F.text == "👥 Користувачі")
+async def admin_users_handler(
+    message: Message
+):
+    if not is_admin(
+        message.from_user.id
+    ):
+        return
+
+    await message.answer(
+        "👥 КОРИСТУВАЧІ\n"
+        "━━━━━━━━━━━━━━\n\n"
+        f"Зараз у пам'яті: {len(users)}\n\n"
+        "Постійний список ще не підключений.\n\n"
+        "Після підключення бази тут зможемо "
+        "показувати ID, ім'я, username, дату "
+        "реєстрації та останню активність.",
+        reply_markup=admin_keyboard,
+    )
+
+
+@dp.message(F.text == "📢 Розсилка")
+async def admin_broadcast_handler(
+    message: Message
+):
+    if not is_admin(
+        message.from_user.id
+    ):
+        return
+
+    await message.answer(
+        "📢 РОЗСИЛКА\n"
+        "━━━━━━━━━━━━━━\n\n"
+        "Розсилку поки не запускаємо.\n\n"
+        "Спочатку підключимо постійну базу "
+        "користувачів, щоб бот не втрачав "
+        "одержувачів після перезапуску.\n\n"
+        "Після цього тут буде:\n"
+        "✍️ створення повідомлення\n"
+        "👁 попередній перегляд\n"
+        "✅ підтвердження\n"
+        "📨 результат розсилки",
+        reply_markup=admin_keyboard,
+    )
+
+
+@dp.message(
+    F.text == "❌ Закрити адмін-панель"
+)
+async def close_admin_handler(
+    message: Message
+):
+    if not is_admin(
+        message.from_user.id
+    ):
+        return
+
+    user_data = users.get(
+        message.from_user.id
+    )
+
+    if (
+        user_data
+        and user_data.get(
+            "selected_route"
+        )
+    ):
+        keyboard = route_keyboard
+    else:
+        keyboard = start_keyboard
+
+    await message.answer(
+        "✅ Адмін-панель закрито.",
+        reply_markup=keyboard,
+    )
+
+
+# ==================================================
 # START
 # ==================================================
 
@@ -2015,25 +2237,6 @@ async def location_handler(
 
 
 # ==================================================
-# DEBUG
-# ==================================================
-
-@dp.message(F.text == "/debug")
-async def debug_handler(
-    message: Message
-):
-    vehicles = await get_live_vehicles()
-
-    await message.answer(
-        "🔧 DEBUG\n\n"
-        f"🚏 Зупинок: {len(stops)}\n"
-        f"🚌 Маршрутів: {len(routes)}\n"
-        f"🚍 Trips: {len(trips)}\n"
-        f"🛰 Свіжих GPS-машин: {len(vehicles)}"
-    )
-
-
-# ==================================================
 # WHERE IS TRANSPORT
 # ==================================================
 
@@ -2092,7 +2295,7 @@ async def where_transport_handler(
 
 
 # ==================================================
-# ALL ROUTES BUTTON — NEW
+# ALL ROUTES BUTTON
 # ==================================================
 
 @dp.message(
@@ -2316,10 +2519,6 @@ async def text_handler(
             "selected_route"
         ] = best
 
-        # НОВЕ:
-        # зберігаємо всі знайдені варіанти,
-        # щоб кнопка "Всі варіанти"
-        # могла показати їх без нового пошуку.
         users[user_id][
             "route_options"
         ] = options
@@ -2365,7 +2564,7 @@ async def text_handler(
 
 async def main():
     print(
-        "MENI-TUDY ALL ROUTES START",
+        "MENI-TUDY ADMIN START",
         flush=True,
     )
 
