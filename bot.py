@@ -20,7 +20,7 @@ from aiogram.types import (
 )
 
 # ==================================================
-# НАЛАШТУВАННЯ
+# CONFIG
 # ==================================================
 
 TOKEN = os.getenv("BOT_TOKEN")
@@ -33,18 +33,17 @@ dp = Dispatcher()
 
 GTFS_URL = "https://city.dozor.tech/iv-frankivsk/gtfs/static.zip"
 
-GPS_URLS = [
-    (
-        "vehicle_position",
-        "https://city.dozor.tech/iv-frankivsk/gtfs/vehicle_position",
-    ),
-    (
-        "devices.json",
-        "https://city.dozor.tech/ua/iv-frankivsk/devices.json",
-    ),
-]
+DEVICES_URL = (
+    "https://city.dozor.tech/ua/iv-frankivsk/devices.json"
+)
 
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
+
+# GPS старіший за цей час не вважаємо "живим"
+MAX_GPS_AGE_SECONDS = 5 * 60
+
+# Максимальна відстань пішки до/від зупинки
+MAX_WALK_METERS = 850
 
 users = {}
 
@@ -55,15 +54,12 @@ trips = {}
 trip_sequences = defaultdict(list)
 stop_to_trips = defaultdict(list)
 
-calendar_services = {}
-calendar_exceptions = defaultdict(dict)
-
 
 # ==================================================
-# КЛАВІАТУРА
+# KEYBOARDS
 # ==================================================
 
-location_keyboard = ReplyKeyboardMarkup(
+start_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [
             KeyboardButton(
@@ -81,18 +77,46 @@ location_keyboard = ReplyKeyboardMarkup(
 )
 
 
+new_route_keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [
+            KeyboardButton(
+                text="🧭 Новий маршрут",
+            )
+        ],
+        [
+            KeyboardButton(
+                text="📍 Оновити мою геолокацію",
+                request_location=True,
+            )
+        ],
+    ],
+    resize_keyboard=True,
+)
+
+
 # ==================================================
-# ВІДСТАНЬ
+# BASIC HELPERS
 # ==================================================
 
-def distance_meters(lat1, lon1, lat2, lon2):
+def distance_meters(
+    lat1,
+    lon1,
+    lat2,
+    lon2,
+):
     radius = 6371000
 
     p1 = math.radians(lat1)
     p2 = math.radians(lat2)
 
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
+    dlat = math.radians(
+        lat2 - lat1
+    )
+
+    dlon = math.radians(
+        lon2 - lon1
+    )
 
     a = (
         math.sin(dlat / 2) ** 2
@@ -107,88 +131,75 @@ def distance_meters(lat1, lon1, lat2, lon2):
     )
 
 
-# ==================================================
-# ЧАС
-# ==================================================
+def walking_minutes(distance):
+    # ~80 м/хв
+    return max(
+        1,
+        round(distance / 80),
+    )
 
-def gtfs_time_to_seconds(value):
+
+def current_time():
+    return datetime.now(
+        KYIV_TZ
+    )
+
+
+def parse_gps_time(value):
     if not value:
         return None
 
     try:
-        h, m, s = map(
-            int,
-            value.split(":"),
+        dt = datetime.strptime(
+            value,
+            "%Y-%m-%d %H:%M:%S",
         )
 
-        return h * 3600 + m * 60 + s
+        return dt.replace(
+            tzinfo=KYIV_TZ
+        )
 
     except Exception:
         return None
 
 
-def seconds_to_clock(seconds):
-    seconds = int(seconds)
+# ==================================================
+# HTTP
+# ==================================================
 
-    hours = (seconds // 3600) % 24
-    minutes = (seconds % 3600) // 60
-
-    return f"{hours:02d}:{minutes:02d}"
-
-
-def format_minutes(value):
-    value = max(
-        1,
-        round(value),
-    )
-
-    if value < 60:
-        return f"{value} хв"
-
-    hours = value // 60
-    minutes = value % 60
-
-    if minutes == 0:
-        return f"{hours} год"
-
-    return f"{hours} год {minutes} хв"
-
-
-def current_time_info():
-    now = datetime.now(KYIV_TZ)
-
-    seconds = (
-        now.hour * 3600
-        + now.minute * 60
-        + now.second
-    )
-
-    return now, seconds
+def default_headers():
+    return {
+        "User-Agent": "MeniTudyTelegramBot/2.0",
+        "Accept": "*/*",
+    }
 
 
 # ==================================================
-# ГЕОКОДУВАННЯ
+# GEOCODING
 # ==================================================
 
 async def geocode_address(address):
-    url = "https://nominatim.openstreetmap.org/search"
+    url = (
+        "https://nominatim.openstreetmap.org/search"
+    )
 
     params = {
-        "q": f"{address}, Івано-Франківськ, Україна",
+        "q": (
+            f"{address}, "
+            "Івано-Франківськ, Україна"
+        ),
         "format": "jsonv2",
         "limit": 1,
         "countrycodes": "ua",
     }
 
-    headers = {
-        "User-Agent": "MeniTudyTelegramBot/1.0"
-    }
-
-    timeout = aiohttp.ClientTimeout(total=15)
+    timeout = aiohttp.ClientTimeout(
+        total=15
+    )
 
     try:
         async with aiohttp.ClientSession(
-            headers=headers,
+            headers=default_headers(),
             timeout=timeout,
         ) as session:
 
@@ -206,8 +217,16 @@ async def geocode_address(address):
                     return None
 
                 return {
-                    "latitude": float(data[0]["lat"]),
-                    "longitude": float(data[0]["lon"]),
+                    "latitude": float(
+                        data[0]["lat"]
+                    ),
+                    "longitude": float(
+                        data[0]["lon"]
+                    ),
+                    "display_name": data[0].get(
+                        "display_name",
+                        address,
+                    ),
                 }
 
     except Exception as error:
@@ -220,23 +239,30 @@ async def geocode_address(address):
 
 
 # ==================================================
-# CSV
+# GTFS CSV
 # ==================================================
 
-def read_small_csv(archive, filename):
-    with archive.open(filename) as raw:
+def read_csv(
+    archive,
+    filename,
+):
+    with archive.open(
+        filename
+    ) as raw:
 
         text = io.TextIOWrapper(
             raw,
             encoding="utf-8-sig",
         )
 
-        for row in csv.DictReader(text):
+        for row in csv.DictReader(
+            text
+        ):
             yield row
 
 
 # ==================================================
-# GTFS
+# LOAD GTFS
 # ==================================================
 
 async def load_gtfs():
@@ -245,23 +271,19 @@ async def load_gtfs():
     global trips
     global trip_sequences
     global stop_to_trips
-    global calendar_services
-    global calendar_exceptions
 
     print(
         "GTFS DOWNLOAD START",
         flush=True,
     )
 
-    headers = {
-        "User-Agent": "MeniTudyTelegramBot/1.0"
-    }
-
-    timeout = aiohttp.ClientTimeout(total=60)
+    timeout = aiohttp.ClientTimeout(
+        total=60
+    )
 
     try:
         async with aiohttp.ClientSession(
-            headers=headers,
+            headers=default_headers(),
             timeout=timeout,
         ) as session:
 
@@ -270,9 +292,9 @@ async def load_gtfs():
             ) as response:
 
                 if response.status != 200:
-
                     print(
-                        f"GTFS HTTP ERROR {response.status}",
+                        "GTFS HTTP ERROR:",
+                        response.status,
                         flush=True,
                     )
 
@@ -280,17 +302,8 @@ async def load_gtfs():
 
                 content = await response.read()
 
-        print(
-            f"GTFS ZIP: {len(content)} bytes",
-            flush=True,
-        )
-
         archive = zipfile.ZipFile(
             io.BytesIO(content)
-        )
-
-        filenames = set(
-            archive.namelist()
         )
 
         # ------------------------------------------
@@ -299,21 +312,28 @@ async def load_gtfs():
 
         new_stops = {}
 
-        for row in read_small_csv(
+        for row in read_csv(
             archive,
             "stops.txt",
         ):
-
             try:
-                stop_id = row["stop_id"]
+                stop_id = row[
+                    "stop_id"
+                ]
 
-                new_stops[stop_id] = (
+                new_stops[
+                    stop_id
+                ] = (
                     row.get(
                         "stop_name",
                         "Без назви",
                     ),
-                    float(row["stop_lat"]),
-                    float(row["stop_lon"]),
+                    float(
+                        row["stop_lat"]
+                    ),
+                    float(
+                        row["stop_lon"]
+                    ),
                 )
 
             except Exception:
@@ -321,22 +341,16 @@ async def load_gtfs():
 
         stops = new_stops
 
-        print(
-            f"STOPS: {len(stops)}",
-            flush=True,
-        )
-
         # ------------------------------------------
         # ROUTES
         # ------------------------------------------
 
         new_routes = {}
 
-        for row in read_small_csv(
+        for row in read_csv(
             archive,
             "routes.txt",
         ):
-
             route_id = row.get(
                 "route_id"
             )
@@ -344,23 +358,24 @@ async def load_gtfs():
             if not route_id:
                 continue
 
-            new_routes[route_id] = (
-                row.get(
+            new_routes[
+                route_id
+            ] = {
+                "short_name": row.get(
                     "route_short_name",
                     "",
                 ),
-                row.get(
+                "long_name": row.get(
                     "route_long_name",
                     "",
                 ),
-            )
+                "type": row.get(
+                    "route_type",
+                    "",
+                ),
+            }
 
         routes = new_routes
-
-        print(
-            f"ROUTES: {len(routes)}",
-            flush=True,
-        )
 
         # ------------------------------------------
         # TRIPS
@@ -368,11 +383,10 @@ async def load_gtfs():
 
         new_trips = {}
 
-        for row in read_small_csv(
+        for row in read_csv(
             archive,
             "trips.txt",
         ):
-
             trip_id = row.get(
                 "trip_id"
             )
@@ -380,103 +394,29 @@ async def load_gtfs():
             if not trip_id:
                 continue
 
-            new_trips[trip_id] = (
-                row.get(
+            new_trips[
+                trip_id
+            ] = {
+                "route_id": row.get(
                     "route_id",
                     "",
                 ),
-                row.get(
-                    "service_id",
-                    "",
-                ),
-                row.get(
+                "headsign": row.get(
                     "trip_headsign",
                     "",
                 ),
-            )
+            }
 
         trips = new_trips
 
-        print(
-            f"TRIPS: {len(trips)}",
-            flush=True,
-        )
-
-        # ------------------------------------------
-        # CALENDAR
-        # ------------------------------------------
-
-        new_calendar = {}
-
-        if "calendar.txt" in filenames:
-
-            for row in read_small_csv(
-                archive,
-                "calendar.txt",
-            ):
-
-                service_id = row.get(
-                    "service_id"
-                )
-
-                if service_id:
-
-                    new_calendar[
-                        service_id
-                    ] = row
-
-        calendar_services = new_calendar
-
-        # ------------------------------------------
-        # CALENDAR DATES
-        # ------------------------------------------
-
-        new_exceptions = defaultdict(dict)
-
-        if "calendar_dates.txt" in filenames:
-
-            for row in read_small_csv(
-                archive,
-                "calendar_dates.txt",
-            ):
-
-                service_id = row.get(
-                    "service_id"
-                )
-
-                date = row.get(
-                    "date"
-                )
-
-                exception_type = row.get(
-                    "exception_type"
-                )
-
-                if (
-                    service_id
-                    and date
-                    and exception_type
-                ):
-
-                    new_exceptions[
-                        date
-                    ][service_id] = exception_type
-
-        calendar_exceptions = new_exceptions
-
         # ------------------------------------------
         # STOP TIMES
-        # Потокове читання для економії RAM
+        # streaming — без великого проміжного list
         # ------------------------------------------
 
-        new_sequences = defaultdict(list)
-
-        print(
-            "READING STOP_TIMES...",
-            flush=True,
+        new_sequences = defaultdict(
+            list
         )
-
-        row_count = 0
 
         with archive.open(
             "stop_times.txt"
@@ -487,7 +427,9 @@ async def load_gtfs():
                 encoding="utf-8-sig",
             )
 
-            reader = csv.DictReader(text)
+            reader = csv.DictReader(
+                text
+            )
 
             for row in reader:
 
@@ -499,7 +441,10 @@ async def load_gtfs():
                     "stop_id"
                 )
 
-                if not trip_id or not stop_id:
+                if (
+                    not trip_id
+                    or not stop_id
+                ):
                     continue
 
                 try:
@@ -513,38 +458,17 @@ async def load_gtfs():
                 except Exception:
                     continue
 
-                arrival = gtfs_time_to_seconds(
-                    row.get(
-                        "arrival_time"
-                    )
-                )
-
-                departure = gtfs_time_to_seconds(
-                    row.get(
-                        "departure_time"
-                    )
-                )
-
                 new_sequences[
                     trip_id
                 ].append(
                     (
                         sequence,
                         stop_id,
-                        arrival,
-                        departure,
                     )
                 )
 
-                row_count += 1
-
-        print(
-            f"STOP_TIMES: {row_count}",
-            flush=True,
-        )
-
         # ------------------------------------------
-        # ІНДЕКС ЗУПИНОК
+        # INDEX
         # ------------------------------------------
 
         new_stop_to_trips = defaultdict(
@@ -584,14 +508,16 @@ async def load_gtfs():
         del content
 
         print(
-            "GTFS READY",
+            "GTFS READY:",
+            f"{len(stops)} stops,",
+            f"{len(routes)} routes,",
+            f"{len(trips)} trips",
             flush=True,
         )
 
         return True
 
     except Exception as error:
-
         print(
             f"GTFS ERROR: {repr(error)}",
             flush=True,
@@ -601,91 +527,158 @@ async def load_gtfs():
 
 
 # ==================================================
-# КАЛЕНДАР
+# LIVE VEHICLES
 # ==================================================
 
-def service_is_active(
-    service_id,
-    date,
-):
-    date_string = date.strftime(
-        "%Y%m%d"
+async def get_live_vehicles():
+    timeout = aiohttp.ClientTimeout(
+        total=15
     )
 
-    exception = (
-        calendar_exceptions
-        .get(date_string, {})
-        .get(service_id)
-    )
+    try:
+        async with aiohttp.ClientSession(
+            headers=default_headers(),
+            timeout=timeout,
+        ) as session:
 
-    if exception == "1":
-        return True
+            async with session.get(
+                DEVICES_URL
+            ) as response:
 
-    if exception == "2":
-        return False
+                if response.status != 200:
+                    return []
 
-    calendar = calendar_services.get(
-        service_id
-    )
+                raw = await response.read()
 
-    if calendar:
-
-        start_date = calendar.get(
-            "start_date",
-            ""
-        )
-
-        end_date = calendar.get(
-            "end_date",
-            ""
-        )
-
-        if (
-            start_date
-            and date_string < start_date
-        ):
-            return False
-
-        if (
-            end_date
-            and date_string > end_date
-        ):
-            return False
-
-        weekdays = [
-            "monday",
-            "tuesday",
-            "wednesday",
-            "thursday",
-            "friday",
-            "saturday",
-            "sunday",
-        ]
-
-        weekday = weekdays[
-            date.weekday()
-        ]
-
-        return (
-            calendar.get(
-                weekday,
-                "0",
+        data = json.loads(
+            raw.decode(
+                "utf-8-sig"
             )
-            == "1"
         )
 
-    return True
+        if not isinstance(
+            data,
+            list,
+        ):
+            return []
+
+        now = current_time()
+
+        vehicles = []
+
+        for item in data:
+
+            if not isinstance(
+                item,
+                dict,
+            ):
+                continue
+
+            try:
+                latitude = float(
+                    item.get(
+                        "latitude"
+                    )
+                )
+
+                longitude = float(
+                    item.get(
+                        "longitude"
+                    )
+                )
+
+            except Exception:
+                continue
+
+            gps_time = parse_gps_time(
+                item.get(
+                    "time"
+                )
+            )
+
+            if not gps_time:
+                continue
+
+            age = (
+                now - gps_time
+            ).total_seconds()
+
+            # Майбутній timestamp або дуже старий GPS
+            if (
+                age < -60
+                or age > MAX_GPS_AGE_SECONDS
+            ):
+                continue
+
+            vehicles.append(
+                {
+                    "imei": str(
+                        item.get(
+                            "imei",
+                            "",
+                        )
+                    ),
+                    "gov_number": str(
+                        item.get(
+                            "gov_number",
+                            "",
+                        )
+                    ),
+                    "route_id": str(
+                        item.get(
+                            "route_id",
+                            "",
+                        )
+                    ),
+                    "route_short_name": str(
+                        item.get(
+                            "route_short_name",
+                            "",
+                        )
+                    ).strip(),
+                    "route_long_name": str(
+                        item.get(
+                            "route_long_name",
+                            "",
+                        )
+                    ).strip(),
+                    "route_type": item.get(
+                        "route_type"
+                    ),
+                    "time": gps_time,
+                    "age": age,
+                    "latitude": latitude,
+                    "longitude": longitude,
+                    "speed": item.get(
+                        "speed",
+                        0,
+                    ),
+                    "satellites": item.get(
+                        "satellites",
+                    ),
+                }
+            )
+
+        return vehicles
+
+    except Exception as error:
+        print(
+            f"GPS ERROR: {repr(error)}",
+            flush=True,
+        )
+
+        return []
 
 
 # ==================================================
-# ЗУПИНКИ
+# NEARBY STOPS
 # ==================================================
 
 def nearby_stops(
     latitude,
     longitude,
-    radius=900,
-    limit=20,
+    radius=1000,
+    limit=25,
 ):
     result = []
 
@@ -694,9 +687,11 @@ def nearby_stops(
         stop_data,
     ) in stops.items():
 
-        name, stop_lat, stop_lon = (
-            stop_data
-        )
+        (
+            name,
+            stop_lat,
+            stop_lon,
+        ) = stop_data
 
         distance = distance_meters(
             latitude,
@@ -711,12 +706,16 @@ def nearby_stops(
                 {
                     "id": stop_id,
                     "name": name,
+                    "latitude": stop_lat,
+                    "longitude": stop_lon,
                     "distance": distance,
                 }
             )
 
     result.sort(
-        key=lambda x: x["distance"]
+        key=lambda x: x[
+            "distance"
+        ]
     )
 
     return result[:limit]
@@ -726,7 +725,9 @@ def nearby_stops(
 # ROUTE INFO
 # ==================================================
 
-def route_info(trip_id):
+def get_route_info(
+    trip_id
+):
     trip = trips.get(
         trip_id
     )
@@ -734,7 +735,9 @@ def route_info(trip_id):
     if not trip:
         return None
 
-    route_id, service_id, headsign = trip
+    route_id = trip[
+        "route_id"
+    ]
 
     route = routes.get(
         route_id
@@ -743,59 +746,62 @@ def route_info(trip_id):
     if not route:
         return None
 
-    short_name, long_name = route
-
     number = (
-        short_name
-        or long_name
+        route.get(
+            "short_name"
+        )
+        or route.get(
+            "long_name"
+        )
         or route_id
     )
 
     return {
         "route_id": route_id,
-        "service_id": service_id,
-        "number": number,
-        "headsign": headsign,
+        "number": str(
+            number
+        ).strip(),
+        "long_name": route.get(
+            "long_name",
+            "",
+        ),
+        "headsign": trip.get(
+            "headsign",
+            "",
+        ),
     }
 
 
 # ==================================================
-# ПОШУК МАРШРУТУ
+# DIRECT ROUTE SEARCH
 # ==================================================
 
-def find_best_current_routes(
+def find_direct_routes(
     origin_candidates,
     destination_candidates,
 ):
-    now, current_seconds = (
-        current_time_info()
-    )
-
     destination_map = {
-        item["id"]: item
-        for item in destination_candidates
+        stop["id"]: stop
+        for stop in destination_candidates
+        if stop["distance"]
+        <= MAX_WALK_METERS
     }
 
-    results = []
+    candidates = []
 
     for origin in origin_candidates:
 
-        if origin["distance"] > 600:
+        if (
+            origin["distance"]
+            > MAX_WALK_METERS
+        ):
             continue
 
-        walk_to_minutes = (
-            origin["distance"] / 80
-        )
-
-        reach_stop_seconds = (
-            current_seconds
-            + walk_to_minutes * 60
-            + 60
-        )
-
-        connections = stop_to_trips.get(
-            origin["id"],
-            [],
+        connections = (
+            stop_to_trips.get(
+                origin["id"],
+                [],
+            )
         )
 
         for (
@@ -803,49 +809,13 @@ def find_best_current_routes(
             origin_position,
         ) in connections:
 
-            trip = trips.get(
-                trip_id
-            )
-
-            if not trip:
-                continue
-
-            route_id, service_id, _ = trip
-
-            if not service_is_active(
-                service_id,
-                now.date(),
-            ):
-                continue
-
-            sequence = trip_sequences.get(
-                trip_id
+            sequence = (
+                trip_sequences.get(
+                    trip_id
+                )
             )
 
             if not sequence:
-                continue
-
-            origin_item = sequence[
-                origin_position
-            ]
-
-            departure = (
-                origin_item[3]
-                if origin_item[3] is not None
-                else origin_item[2]
-            )
-
-            if departure is None:
-                continue
-
-            if departure < reach_stop_seconds:
-                continue
-
-            if (
-                departure
-                - current_seconds
-                > 7200
-            ):
                 continue
 
             for destination_position in range(
@@ -868,719 +838,351 @@ def find_best_current_routes(
                 if not destination:
                     continue
 
-                if destination["distance"] > 600:
-                    continue
-
-                destination_item = (
-                    sequence[
-                        destination_position
-                    ]
-                )
-
-                arrival = (
-                    destination_item[2]
-                    if destination_item[2] is not None
-                    else destination_item[3]
-                )
-
-                if (
-                    arrival is None
-                    or arrival <= departure
-                ):
-                    continue
-
-                info = route_info(
+                info = get_route_info(
                     trip_id
                 )
 
                 if not info:
-                    continue
+                    break
 
-                wait_minutes = max(
-                    0,
-                    (
-                        departure
-                        - current_seconds
-                        - walk_to_minutes * 60
-                    )
-                    / 60,
+                stop_count = (
+                    destination_position
+                    - origin_position
                 )
 
-                ride_minutes = (
-                    arrival - departure
-                ) / 60
-
-                walk_from_minutes = (
-                    destination["distance"]
-                    / 80
+                total_walk = (
+                    origin["distance"]
+                    + destination[
+                        "distance"
+                    ]
                 )
 
-                total_minutes = (
-                    walk_to_minutes
-                    + wait_minutes
-                    + ride_minutes
-                    + walk_from_minutes
+                # Сильніше караємо довгу ходьбу.
+                score = (
+                    total_walk
+                    + stop_count * 18
                 )
 
-                walking_penalty = 0
+                if (
+                    origin["distance"]
+                    > 500
+                ):
+                    score += 400
 
-                if origin["distance"] > 400:
-                    walking_penalty += 5
+                if (
+                    destination[
+                        "distance"
+                    ]
+                    > 500
+                ):
+                    score += 500
 
-                if destination["distance"] > 400:
-                    walking_penalty += 7
-
-                results.append(
+                candidates.append(
                     {
-                        "score": (
-                            total_minutes
-                            + walking_penalty
-                        ),
+                        "score": score,
                         "route": info,
+                        "trip_id": trip_id,
                         "origin": origin,
-                        "destination": destination,
-                        "departure": departure,
-                        "arrival": arrival,
-                        "walk_to_minutes": walk_to_minutes,
-                        "wait_minutes": wait_minutes,
-                        "ride_minutes": ride_minutes,
-                        "walk_from_minutes": walk_from_minutes,
-                        "total_minutes": total_minutes,
-                        "stop_count": (
+                        "destination": (
+                            destination
+                        ),
+                        "origin_position": (
+                            origin_position
+                        ),
+                        "destination_position": (
                             destination_position
-                            - origin_position
+                        ),
+                        "stop_count": (
+                            stop_count
                         ),
                     }
                 )
 
                 break
 
-    best = {}
+    # Один найкращий варіант
+    # на кожен route_id.
+    best_by_route = {}
 
-    for item in results:
+    for item in candidates:
 
         route_id = item[
             "route"
         ]["route_id"]
 
-        old = best.get(
-            route_id
+        previous = (
+            best_by_route.get(
+                route_id
+            )
         )
 
         if (
-            old is None
-            or item["score"] < old["score"]
+            previous is None
+            or item["score"]
+            < previous["score"]
         ):
-            best[route_id] = item
+            best_by_route[
+                route_id
+            ] = item
 
     result = list(
-        best.values()
+        best_by_route.values()
     )
 
     result.sort(
-        key=lambda x: x["score"]
+        key=lambda x: x[
+            "score"
+        ]
     )
 
     return result
 
 
 # ==================================================
-# GPS DEBUG
+# MATCH GPS VEHICLES TO ROUTE
 # ==================================================
 
-@dp.message(F.text == "/gpsdebug")
-async def gps_debug_handler(message: Message):
+def live_vehicles_for_route(
+    route,
+    vehicles,
+):
+    route_id = str(
+        route.get(
+            "route_id",
+            ""
+        )
+    ).strip()
 
-    await message.answer(
-        "🛰 Перевіряю живі GPS-дані транспорту...\n"
-        "Зачекай кілька секунд."
+    number = str(
+        route.get(
+            "number",
+            ""
+        )
+    ).strip()
+
+    matches = []
+
+    for vehicle in vehicles:
+
+        vehicle_route_id = str(
+            vehicle.get(
+                "route_id",
+                ""
+            )
+        ).strip()
+
+        vehicle_number = str(
+            vehicle.get(
+                "route_short_name",
+                ""
+            )
+        ).strip()
+
+        # Найнадійніше — route_id.
+        # short_name лишаємо fallback.
+        if (
+            vehicle_route_id
+            == route_id
+            or (
+                number
+                and vehicle_number
+                == number
+            )
+        ):
+            matches.append(
+                vehicle
+            )
+
+    return matches
+
+
+# ==================================================
+# GPS ANALYSIS FOR BOARDING STOP
+# ==================================================
+
+def analyze_live_route(
+    candidate,
+    vehicles,
+):
+    matches = live_vehicles_for_route(
+        candidate["route"],
+        vehicles,
     )
 
-    lines = [
-        "🛰 GPS DEBUG",
-        "",
+    if not matches:
+        return {
+            "count": 0,
+            "nearest": None,
+        }
+
+    stop = candidate[
+        "origin"
     ]
 
-    headers = {
-        "User-Agent": "MeniTudyTelegramBot/1.0",
-        "Accept": "*/*",
+    ranked = []
+
+    for vehicle in matches:
+
+        distance = distance_meters(
+            vehicle[
+                "latitude"
+            ],
+            vehicle[
+                "longitude"
+            ],
+            stop[
+                "latitude"
+            ],
+            stop[
+                "longitude"
+            ],
+        )
+
+        ranked.append(
+            (
+                distance,
+                vehicle,
+            )
+        )
+
+    ranked.sort(
+        key=lambda x: x[0]
+    )
+
+    nearest_distance, nearest = (
+        ranked[0]
+    )
+
+    return {
+        "count": len(matches),
+        "nearest": nearest,
+        "distance_to_stop": (
+            nearest_distance
+        ),
     }
 
-    timeout = aiohttp.ClientTimeout(
-        total=20
+
+# ==================================================
+# FORMAT GPS
+# ==================================================
+
+def format_gps_age(
+    seconds
+):
+    seconds = max(
+        0,
+        int(seconds),
     )
 
-    try:
-
-        async with aiohttp.ClientSession(
-            headers=headers,
-            timeout=timeout,
-        ) as session:
-
-            for name, url in GPS_URLS:
-
-                lines.append(
-                    f"━━ {name} ━━"
-                )
-
-                try:
-
-                    async with session.get(
-                        url
-                    ) as response:
-
-                        raw = await response.read()
-
-                        content_type = (
-                            response.headers.get(
-                                "Content-Type",
-                                "невідомо",
-                            )
-                        )
-
-                        lines.append(
-                            f"HTTP: {response.status}"
-                        )
-
-                        lines.append(
-                            f"Content-Type: {content_type}"
-                        )
-
-                        lines.append(
-                            f"Розмір: {len(raw)} байт"
-                        )
-
-                        if response.status != 200:
-
-                            lines.append(
-                                "❌ Сервер не повернув HTTP 200"
-                            )
-
-                            lines.append("")
-
-                            continue
-
-                        # --------------------------
-                        # ПРОБУЄМО UTF-8 + JSON
-                        # --------------------------
-
-                        try:
-
-                            decoded = raw.decode(
-                                "utf-8-sig"
-                            )
-
-                            data = json.loads(
-                                decoded
-                            )
-
-                            lines.append(
-                                "Формат: ✅ JSON"
-                            )
-
-                            # ----------------------
-                            # JSON LIST
-                            # ----------------------
-
-                            if isinstance(
-                                data,
-                                list,
-                            ):
-
-                                lines.append(
-                                    f"Об'єктів: {len(data)}"
-                                )
-
-                                if data:
-
-                                    first = data[0]
-
-                                    lines.append(
-                                        f"Тип першого: "
-                                        f"{type(first).__name__}"
-                                    )
-
-                                    if isinstance(
-                                        first,
-                                        dict,
-                                    ):
-
-                                        keys = list(
-                                            first.keys()
-                                        )
-
-                                        lines.append(
-                                            "Поля:"
-                                        )
-
-                                        lines.append(
-                                            ", ".join(
-                                                keys[:25]
-                                            )
-                                        )
-
-                                        preview = {}
-
-                                        for key in keys[:15]:
-
-                                            value = first.get(
-                                                key
-                                            )
-
-                                            if isinstance(
-                                                value,
-                                                (
-                                                    str,
-                                                    int,
-                                                    float,
-                                                    bool,
-                                                    type(None),
-                                                ),
-                                            ):
-
-                                                preview[
-                                                    key
-                                                ] = value
-
-                                        lines.append(
-                                            "Перший об'єкт:"
-                                        )
-
-                                        lines.append(
-                                            str(
-                                                preview
-                                            )[:1200]
-                                        )
-
-                            # ----------------------
-                            # JSON DICT
-                            # ----------------------
-
-                            elif isinstance(
-                                data,
-                                dict,
-                            ):
-
-                                keys = list(
-                                    data.keys()
-                                )
-
-                                lines.append(
-                                    "Тип: JSON object"
-                                )
-
-                                lines.append(
-                                    "Верхні поля:"
-                                )
-
-                                lines.append(
-                                    ", ".join(
-                                        keys[:25]
-                                    )
-                                )
-
-                                found_child = False
-
-                                for key in keys[:20]:
-
-                                    value = data.get(
-                                        key
-                                    )
-
-                                    if isinstance(
-                                        value,
-                                        list,
-                                    ):
-
-                                        found_child = True
-
-                                        lines.append(
-                                            f"{key}: "
-                                            f"{len(value)} об'єктів"
-                                        )
-
-                                        if (
-                                            value
-                                            and isinstance(
-                                                value[0],
-                                                dict,
-                                            )
-                                        ):
-
-                                            child_keys = list(
-                                                value[0].keys()
-                                            )
-
-                                            lines.append(
-                                                "Поля першого:"
-                                            )
-
-                                            lines.append(
-                                                ", ".join(
-                                                    child_keys[:25]
-                                                )
-                                            )
-
-                                            preview = {}
-
-                                            for child_key in child_keys[:15]:
-
-                                                child_value = (
-                                                    value[0].get(
-                                                        child_key
-                                                    )
-                                                )
-
-                                                if isinstance(
-                                                    child_value,
-                                                    (
-                                                        str,
-                                                        int,
-                                                        float,
-                                                        bool,
-                                                        type(None),
-                                                    ),
-                                                ):
-
-                                                    preview[
-                                                        child_key
-                                                    ] = child_value
-
-                                            lines.append(
-                                                "Приклад:"
-                                            )
-
-                                            lines.append(
-                                                str(
-                                                    preview
-                                                )[:1200]
-                                            )
-
-                                        break
-
-                                if not found_child:
-
-                                    preview = {}
-
-                                    for key in keys[:15]:
-
-                                        value = data.get(
-                                            key
-                                        )
-
-                                        if isinstance(
-                                            value,
-                                            (
-                                                str,
-                                                int,
-                                                float,
-                                                bool,
-                                                type(None),
-                                            ),
-                                        ):
-
-                                            preview[
-                                                key
-                                            ] = value
-
-                                    if preview:
-
-                                        lines.append(
-                                            "Приклад:"
-                                        )
-
-                                        lines.append(
-                                            str(
-                                                preview
-                                            )[:1200]
-                                        )
-
-                        except Exception as json_error:
-
-                            lines.append(
-                                "Формат: ❓ не JSON"
-                            )
-
-                            lines.append(
-                                f"JSON error: "
-                                f"{type(json_error).__name__}"
-                            )
-
-                            lines.append(
-                                "Перші 32 байти (HEX):"
-                            )
-
-                            lines.append(
-                                raw[:32].hex()
-                            )
-
-                except Exception as error:
-
-                    lines.append(
-                        f"❌ Помилка запиту: "
-                        f"{type(error).__name__}: {error}"
-                    )
-
-                lines.append("")
-
-    except Exception as error:
-
-        lines.append(
-            f"❌ Загальна помилка: "
-            f"{type(error).__name__}: {error}"
+    if seconds < 60:
+        return (
+            f"{seconds} с тому"
         )
 
-    result = "\n".join(
-        lines
+    return (
+        f"{seconds // 60} хв тому"
     )
 
-    # Telegram має ліміт повідомлення.
-    if len(result) > 3900:
-        result = result[:3900] + "\n\n…обрізано"
 
-    await message.answer(
-        result
+def format_vehicle_distance(
+    meters
+):
+    if meters < 1000:
+        return (
+            f"{round(meters)} м "
+            "від зупинки"
+        )
+
+    return (
+        f"{meters / 1000:.1f} км "
+        "від зупинки"
     )
 
 
 # ==================================================
-# GTFS DEBUG
+# BUILD ROUTE RESPONSE
 # ==================================================
 
-@dp.message(F.text == "/debug")
-async def debug_handler(message: Message):
-
-    now, _ = current_time_info()
-
-    service_ids = {
-        trip[1]
-        for trip in trips.values()
-        if trip[1]
-    }
-
-    active_services = {
-        service_id
-        for service_id in service_ids
-        if service_is_active(
-            service_id,
-            now.date(),
-        )
-    }
-
-    active_trips = sum(
-        1
-        for trip in trips.values()
-        if service_is_active(
-            trip[1],
-            now.date(),
+async def build_route_result(
+    destination_text,
+    origin_stops,
+    destination_stops,
+):
+    direct_routes = (
+        find_direct_routes(
+            origin_stops,
+            destination_stops,
         )
     )
 
-    date_string = now.strftime(
-        "%Y%m%d"
+    if not direct_routes:
+        return None
+
+    # Отримуємо GPS один раз
+    # для всіх маршрутів.
+    vehicles = (
+        await get_live_vehicles()
     )
 
-    await message.answer(
-        "🔧 GTFS DEBUG\n\n"
-        f"🕙 {now.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-        f"🚏 Зупинок: {len(stops)}\n"
-        f"🚌 Маршрутів: {len(routes)}\n"
-        f"🚍 Рейсів: {len(trips)}\n"
-        f"🧭 Trip sequences: {len(trip_sequences)}\n\n"
-        f"📅 service_id: {len(service_ids)}\n"
-        f"📅 calendar.txt: {len(calendar_services)}\n"
-        f"📅 calendar_dates: {len(calendar_exceptions)}\n\n"
-        f"✅ Активних service_id: {len(active_services)}\n"
-        f"✅ Активних рейсів: {active_trips}\n"
-        f"🗓 Винятків сьогодні: "
-        f"{len(calendar_exceptions.get(date_string, {}))}"
-    )
+    enriched = []
 
+    for candidate in (
+        direct_routes[:10]
+    ):
 
-# ==================================================
-# DEBUG ROUTE
-# ==================================================
-
-@dp.message(F.text == "/debugroute")
-async def debug_route_handler(message: Message):
-
-    user_id = message.from_user.id
-
-    user = users.get(
-        user_id
-    )
-
-    if not user:
-
-        await message.answer(
-            "Спочатку натисни /start "
-            "і надішли геолокацію."
+        live = analyze_live_route(
+            candidate,
+            vehicles,
         )
 
-        return
+        candidate[
+            "live"
+        ] = live
 
-    origin_stops = user.get(
-        "origin_stops"
-    )
+        # Якщо є живий транспорт —
+        # він отримує бонус.
+        live_bonus = 0
 
-    if not origin_stops:
+        if live["count"] > 0:
+            live_bonus = -350
 
-        await message.answer(
-            "📍 Спочатку надішли геолокацію."
+            distance = live.get(
+                "distance_to_stop",
+                999999,
+            )
+
+            if distance < 1500:
+                live_bonus -= 250
+
+            elif distance < 3000:
+                live_bonus -= 120
+
+        candidate[
+            "final_score"
+        ] = (
+            candidate["score"]
+            + live_bonus
         )
 
-        return
-
-    now, current_seconds = (
-        current_time_info()
-    )
-
-    lines = [
-        "🔬 DEBUG ROUTE",
-        "",
-        f"🕙 Зараз: {now.strftime('%H:%M:%S')}",
-        "",
-    ]
-
-    for origin in origin_stops[:5]:
-
-        lines.append(
-            f"🚏 {origin['name']} — "
-            f"{round(origin['distance'])} м"
+        enriched.append(
+            candidate
         )
 
-        connections = stop_to_trips.get(
-            origin["id"],
-            [],
-        )
-
-        departures = []
-
-        for (
-            trip_id,
-            position,
-        ) in connections:
-
-            trip = trips.get(
-                trip_id
-            )
-
-            if not trip:
-                continue
-
-            route_id, service_id, _ = trip
-
-            if not service_is_active(
-                service_id,
-                now.date(),
-            ):
-                continue
-
-            sequence = trip_sequences.get(
-                trip_id
-            )
-
-            if (
-                not sequence
-                or position >= len(sequence)
-            ):
-                continue
-
-            item = sequence[
-                position
-            ]
-
-            departure = (
-                item[3]
-                if item[3] is not None
-                else item[2]
-            )
-
-            if departure is None:
-                continue
-
-            route = route_info(
-                trip_id
-            )
-
-            if not route:
-                continue
-
-            if (
-                current_seconds - 10800
-                <= departure
-                <= current_seconds + 14400
-            ):
-
-                departures.append(
-                    (
-                        departure,
-                        route["number"],
-                    )
-                )
-
-        departures.sort(
-            key=lambda x: x[0]
-        )
-
-        unique = []
-        seen = set()
-
-        for departure, number in departures:
-
-            key = (
-                number,
-                departure,
-            )
-
-            if key in seen:
-                continue
-
-            seen.add(key)
-
-            unique.append(
-                (
-                    departure,
-                    number,
-                )
-            )
-
-        if not unique:
-
-            lines.append(
-                "   ❌ Немає часів ± кілька годин"
-            )
-
-        else:
-
-            for (
-                departure,
-                number,
-            ) in unique[:12]:
-
-                if departure < current_seconds:
-                    mark = "❌"
-                else:
-                    mark = "✅"
-
-                lines.append(
-                    f"   №{number} — "
-                    f"{seconds_to_clock(departure)} "
-                    f"{mark}"
-                )
-
-        lines.append("")
-
-    lines.extend(
-        [
-            "❌ = час уже минув",
-            "✅ = час у GTFS ще попереду",
+    enriched.sort(
+        key=lambda x: x[
+            "final_score"
         ]
     )
 
-    await message.answer(
-        "\n".join(lines)
-    )
+    return {
+        "destination": (
+            destination_text
+        ),
+        "vehicles_total": len(
+            vehicles
+        ),
+        "routes": enriched,
+    }
 
 
 # ==================================================
@@ -1588,8 +1190,9 @@ async def debug_route_handler(message: Message):
 # ==================================================
 
 @dp.message(CommandStart())
-async def start_handler(message: Message):
-
+async def start_handler(
+    message: Message
+):
     users[
         message.from_user.id
     ] = {
@@ -1598,16 +1201,18 @@ async def start_handler(message: Message):
 
     await message.answer(
         "🚌 МЕНІ ТУДИ\n"
-        "Івано-Франківськ\n\n"
-        "Куди б ти не збирався — "
-        "спробую знайти найзручніший шлях "
-        "громадським транспортом ⚡\n\n"
-        "📍 знайду найближчу зупинку\n"
-        "🚌 підберу потрібний маршрут\n"
-        "🚏 підкажу, де виходити\n"
-        "🛰 готуємо підключення транспорту наживо\n\n"
-        "Спочатку визначимо точку старту 👇",
-        reply_markup=location_keyboard,
+        "━━━━━━━━━━━━━━\n"
+        "Твій транспортний помічник "
+        "в Івано-Франківську ⚡\n\n"
+        "Напиши, куди тобі потрібно, "
+        "а я допоможу розібратися з дорогою:\n\n"
+        "🚏 знайду зручну зупинку\n"
+        "🚌 підберу прямий маршрут\n"
+        "🛰 перевірю транспорт наживо\n"
+        "📍 покажу, де найближча машина\n"
+        "🏁 підкажу, де виходити\n\n"
+        "Для початку — звідки вирушаємо? 👇",
+        reply_markup=start_keyboard,
     )
 
 
@@ -1616,9 +1221,12 @@ async def start_handler(message: Message):
 # ==================================================
 
 @dp.message(F.location)
-async def location_handler(message: Message):
-
-    user_id = message.from_user.id
+async def location_handler(
+    message: Message
+):
+    user_id = (
+        message.from_user.id
+    )
 
     latitude = (
         message.location.latitude
@@ -1634,10 +1242,14 @@ async def location_handler(message: Message):
     )
 
     users[user_id] = {
-        "step": "waiting_destination",
-        "origin_stops": origin_stops,
+        "step": (
+            "waiting_destination"
+        ),
         "latitude": latitude,
         "longitude": longitude,
+        "origin_stops": (
+            origin_stops
+        ),
     }
 
     if origin_stops:
@@ -1645,10 +1257,13 @@ async def location_handler(message: Message):
         nearest = origin_stops[0]
 
         await message.answer(
-            "📍 Точку старту знайшов ✓\n\n"
-            f"Найближча зупинка:\n"
-            f"🚏 «{nearest['name']}»\n"
-            f"🚶 приблизно {round(nearest['distance'])} м від тебе\n\n"
+            "📍 Є! Точку старту визначив\n"
+            "━━━━━━━━━━━━━━\n"
+            f"🚏 Найближча зупинка:\n"
+            f"«{nearest['name']}»\n\n"
+            f"🚶 До неї приблизно "
+            f"{round(nearest['distance'])} м "
+            f"({walking_minutes(nearest['distance'])} хв)\n\n"
             "Тепер найцікавіше 😎\n"
             "🏁 Куди тобі потрібно?",
             reply_markup=ReplyKeyboardRemove(),
@@ -1657,11 +1272,91 @@ async def location_handler(message: Message):
     else:
 
         await message.answer(
-            "📍 Геолокацію отримав, але поруч "
-            "не знайшов зупинки в базі.\n\n"
-            "🏁 Все одно напиши, куди тобі потрібно.",
+            "📍 Точку старту отримав ✓\n\n"
+            "Поруч не знайшов зупинки "
+            "в межах приблизно 1 км.\n\n"
+            "🏁 Напиши пункт призначення — "
+            "все одно спробую знайти варіант.",
             reply_markup=ReplyKeyboardRemove(),
         )
+
+
+# ==================================================
+# DEBUG GPS
+# ==================================================
+
+@dp.message(F.text == "/gpsdebug")
+async def gps_debug_handler(
+    message: Message
+):
+    vehicles = (
+        await get_live_vehicles()
+    )
+
+    now = current_time()
+
+    route_counts = defaultdict(
+        int
+    )
+
+    for vehicle in vehicles:
+        route_counts[
+            vehicle[
+                "route_short_name"
+            ]
+        ] += 1
+
+    top_routes = sorted(
+        route_counts.items(),
+        key=lambda x: (
+            -x[1],
+            x[0],
+        ),
+    )
+
+    lines = [
+        "🛰 GPS DEBUG",
+        "",
+        f"🕙 {now.strftime('%H:%M:%S')}",
+        f"✅ Свіжих машин: {len(vehicles)}",
+        "",
+        "Маршрути:",
+    ]
+
+    for (
+        number,
+        count,
+    ) in top_routes[:30]:
+
+        lines.append(
+            f"№{number or '?'} — "
+            f"{count} машин"
+        )
+
+    await message.answer(
+        "\n".join(lines)
+    )
+
+
+# ==================================================
+# DEBUG
+# ==================================================
+
+@dp.message(F.text == "/debug")
+async def debug_handler(
+    message: Message
+):
+    vehicles = (
+        await get_live_vehicles()
+    )
+
+    await message.answer(
+        "🔧 DEBUG\n\n"
+        f"🚏 Зупинок: {len(stops)}\n"
+        f"🚌 Маршрутів GTFS: {len(routes)}\n"
+        f"🚍 Trips: {len(trips)}\n"
+        f"🛰 Свіжих GPS-машин: {len(vehicles)}"
+    )
 
 
 # ==================================================
@@ -1669,21 +1364,56 @@ async def location_handler(message: Message):
 # ==================================================
 
 @dp.message(F.text)
-async def text_handler(message: Message):
+async def text_handler(
+    message: Message
+):
+    user_id = (
+        message.from_user.id
+    )
 
-    user_id = message.from_user.id
-    text = message.text.strip()
+    text = (
+        message.text.strip()
+    )
 
-    if text == "🔎 Ввести адресу":
+    # ----------------------------------------------
+    # NEW ROUTE
+    # ----------------------------------------------
 
-        users[user_id] = {
-            "step": "waiting_origin_address"
+    if text == "🧭 Новий маршрут":
+
+        users[
+            user_id
+        ] = {
+            "step": "waiting_origin"
         }
 
         await message.answer(
-            "🔎 Добре. Напиши адресу, "
-            "звідки ти вирушаєш.\n\n"
-            "Наприклад: Південний бульвар 35",
+            "🧭 Будуємо новий маршрут\n\n"
+            "Звідки вирушаємо? 👇",
+            reply_markup=start_keyboard,
+        )
+
+        return
+
+    # ----------------------------------------------
+    # MANUAL ORIGIN
+    # ----------------------------------------------
+
+    if text == "🔎 Ввести адресу":
+
+        users[
+            user_id
+        ] = {
+            "step": (
+                "waiting_origin_address"
+            )
+        }
+
+        await message.answer(
+            "🔎 Напиши адресу, "
+            "звідки вирушаєш.\n\n"
+            "Наприклад:\n"
+            "Південний бульвар 35",
             reply_markup=ReplyKeyboardRemove(),
         )
 
@@ -1692,60 +1422,87 @@ async def text_handler(message: Message):
     if user_id not in users:
 
         await message.answer(
-            "Натисни /start — і почнемо 🚀"
+            "👋 Почнемо спочатку.\n"
+            "Натисни /start"
         )
 
         return
 
     step = users[
         user_id
-    ].get("step")
+    ].get(
+        "step"
+    )
 
     # ----------------------------------------------
-    # АДРЕСА СТАРТУ
+    # ORIGIN ADDRESS
     # ----------------------------------------------
 
-    if step == "waiting_origin_address":
+    if (
+        step
+        == "waiting_origin_address"
+    ):
 
         await message.answer(
-            "🔎 Шукаю цю адресу..."
+            "🔎 Шукаю точку старту..."
         )
 
-        result = await geocode_address(
-            text
+        result = (
+            await geocode_address(
+                text
+            )
         )
 
         if not result:
 
             await message.answer(
-                "❌ Не зміг знайти цю адресу.\n\n"
-                "Спробуй написати вулицю та номер будинку."
+                "🤔 Не зміг знайти цю адресу.\n\n"
+                "Спробуй написати назву вулиці "
+                "та номер будинку ще раз."
             )
 
             return
 
         origin_stops = nearby_stops(
-            result["latitude"],
-            result["longitude"],
+            result[
+                "latitude"
+            ],
+            result[
+                "longitude"
+            ],
         )
 
-        users[user_id] = {
-            "step": "waiting_destination",
-            "origin_stops": origin_stops,
-            "latitude": result["latitude"],
-            "longitude": result["longitude"],
+        users[
+            user_id
+        ] = {
+            "step": (
+                "waiting_destination"
+            ),
+            "latitude": result[
+                "latitude"
+            ],
+            "longitude": result[
+                "longitude"
+            ],
+            "origin_stops": (
+                origin_stops
+            ),
         }
 
         if origin_stops:
 
-            nearest = origin_stops[0]
+            nearest = (
+                origin_stops[0]
+            )
 
             await message.answer(
-                "📍 Точку старту знайшов ✓\n\n"
-                f"🚏 Найближча зупинка: "
-                f"«{nearest['name']}»\n"
-                f"🚶 {round(nearest['distance'])} м\n\n"
-                "🏁 А тепер напиши, куди їдемо."
+                "📍 Знайшов ✓\n"
+                "━━━━━━━━━━━━━━\n"
+                f"🚏 Найближча зупинка:\n"
+                f"«{nearest['name']}»\n\n"
+                f"🚶 {round(nearest['distance'])} м "
+                f"≈ {walking_minutes(nearest['distance'])} хв\n\n"
+                "🏁 Тепер напиши, куди їдемо."
             )
 
         else:
@@ -1758,32 +1515,44 @@ async def text_handler(message: Message):
         return
 
     # ----------------------------------------------
-    # ПРИЗНАЧЕННЯ
+    # DESTINATION
     # ----------------------------------------------
 
-    if step == "waiting_destination":
+    if (
+        step
+        == "waiting_destination"
+    ):
 
         await message.answer(
-            "🧭 Шукаю найкращий шлях...\n"
-            "Перевіряю зупинки та маршрути."
+            "🧭 Будую маршрут...\n"
+            "🛰 Одночасно перевіряю транспорт наживо."
         )
 
-        destination = await geocode_address(
-            text
+        destination = (
+            await geocode_address(
+                text
+            )
         )
 
         if not destination:
 
             await message.answer(
-                "❌ Не зміг знайти пункт призначення.\n\n"
-                "Спробуй написати адресу трохи точніше."
+                "🤔 Не знайшов пункт призначення.\n\n"
+                "Спробуй написати адресу точніше, "
+                "наприклад: Височана 18."
             )
 
             return
 
-        destination_stops = nearby_stops(
-            destination["latitude"],
-            destination["longitude"],
+        destination_stops = (
+            nearby_stops(
+                destination[
+                    "latitude"
+                ],
+                destination[
+                    "longitude"
+                ],
+            )
         )
 
         origin_stops = users[
@@ -1793,123 +1562,265 @@ async def text_handler(message: Message):
             [],
         )
 
-        results = find_best_current_routes(
-            origin_stops,
-            destination_stops,
+        result = (
+            await build_route_result(
+                text,
+                origin_stops,
+                destination_stops,
+            )
         )
 
-        users[user_id]["step"] = "done"
-
-        if not results:
+        if not result:
 
             await message.answer(
-                "⚠️ За статичним GTFS-розкладом "
-                "зараз не бачу зручного прямого рейсу.\n\n"
-                "Ми вже знаємо, що цей розклад "
-                "не відображає весь транспорт у реальному часі.\n\n"
-                "🛰 Наступний етап — GPS DozoR."
+                "🤔 Прямого маршруту поруч "
+                "не знайшов.\n\n"
+                "Це не означає, що дістатися "
+                "неможливо — найімовірніше, "
+                "потрібна пересадка.\n\n"
+                "🔄 Пошук маршрутів з пересадкою "
+                "буде наступним кроком.",
+                reply_markup=new_route_keyboard,
             )
+
+            users[
+                user_id
+            ]["step"] = "done"
 
             return
 
-        best = results[0]
-        route = best["route"]
+        options = result[
+            "routes"
+        ]
 
-        now, _ = current_time_info()
+        best = options[0]
+
+        route = best[
+            "route"
+        ]
+
+        live = best[
+            "live"
+        ]
 
         lines = [
-            "⚡ ЗНАЙШОВ ВАРІАНТ",
-            "",
-            f"🏁 {text}",
-            f"🕙 Зараз {now.strftime('%H:%M')}",
+            "⚡ МАРШРУТ ЗНАЙДЕНО",
+            "━━━━━━━━━━━━━━",
+            f"🏁 Куди: {text}",
             "",
             f"🚌 Маршрут №{route['number']}",
         ]
 
-        if route["headsign"]:
+        if route.get(
+            "headsign"
+        ):
 
             lines.append(
-                f"➡️ {route['headsign']}"
+                f"➡️ Напрямок: "
+                f"{route['headsign']}"
             )
 
         lines.extend(
             [
                 "",
+                "1️⃣ ДО ЗУПИНКИ",
                 (
-                    f"🚶 До зупинки "
-                    f"«{best['origin']['name']}» — "
-                    f"{round(best['origin']['distance'])} м"
+                    f"🚶 {round(best['origin']['distance'])} м "
+                    f"до «{best['origin']['name']}»"
                 ),
                 (
-                    f"   ≈ "
-                    f"{format_minutes(best['walk_to_minutes'])}"
-                ),
-                "",
-                (
-                    f"🕙 За GTFS: "
-                    f"{seconds_to_clock(best['departure'])}"
-                ),
-                (
-                    f"⌛ Очікування: "
-                    f"≈ {format_minutes(best['wait_minutes'])}"
+                    f"⏱ приблизно "
+                    f"{walking_minutes(best['origin']['distance'])} хв пішки"
                 ),
                 "",
-                (
-                    f"🚌 Їхати "
-                    f"{best['stop_count']} зуп."
-                ),
-                (
-                    f"   ≈ "
-                    f"{format_minutes(best['ride_minutes'])}"
-                ),
-                "",
-                (
-                    f"🚏 Виходити: "
-                    f"«{best['destination']['name']}»"
-                ),
-                (
-                    f"🚶 Звідти ще "
-                    f"{round(best['destination']['distance'])} м"
-                ),
-                "",
-                (
-                    f"⏱ Орієнтовно разом: "
-                    f"{format_minutes(best['total_minutes'])}"
-                ),
-                "",
-                "ℹ️ Поки що це дані статичного GTFS.",
-                "🛰 GPS транспорту підключаємо окремо.",
             ]
         )
 
-        alternatives = results[1:3]
+        # ------------------------------------------
+        # LIVE GPS
+        # ------------------------------------------
+
+        if (
+            live
+            and live[
+                "count"
+            ] > 0
+        ):
+
+            vehicle = live[
+                "nearest"
+            ]
+
+            lines.extend(
+                [
+                    "2️⃣ ТРАНСПОРТ НАЖИВО 🛰",
+                    (
+                        f"🟢 На маршруті зараз бачу "
+                        f"{live['count']} "
+                        f"{'машину' if live['count'] == 1 else 'машини'}"
+                    ),
+                    (
+                        f"📍 Найближча GPS-машина: "
+                        f"{format_vehicle_distance(live['distance_to_stop'])}"
+                    ),
+                ]
+            )
+
+            if vehicle.get(
+                "gov_number"
+            ):
+
+                lines.append(
+                    f"🚍 Борт/номер: "
+                    f"{vehicle['gov_number']}"
+                )
+
+            try:
+                speed = float(
+                    vehicle.get(
+                        "speed",
+                        0,
+                    )
+                )
+
+                lines.append(
+                    f"💨 Швидкість: "
+                    f"{round(speed)} км/год"
+                )
+
+            except Exception:
+                pass
+
+            lines.append(
+                f"🕒 GPS оновлено "
+                f"{format_gps_age(vehicle['age'])}"
+            )
+
+            lines.extend(
+                [
+                    "",
+                    "ℹ️ Відстань до автобуса зараз "
+                    "рахується за GPS по прямій.",
+                    "Точний час прибуття на зупинку "
+                    "ще не показую, щоб не вводити тебе в оману.",
+                    "",
+                ]
+            )
+
+        else:
+
+            lines.extend(
+                [
+                    "2️⃣ ТРАНСПОРТ НАЖИВО 🛰",
+                    (
+                        f"🟡 Свіжої GPS-позиції "
+                        f"маршруту №{route['number']} зараз не бачу."
+                    ),
+                    (
+                        "Маршрут все одно існує в транспортній схемі."
+                    ),
+                    "",
+                ]
+            )
+
+        # ------------------------------------------
+        # RIDE
+        # ------------------------------------------
+
+        lines.extend(
+            [
+                "3️⃣ ПОЇЗДКА",
+                (
+                    f"🚌 Їдь приблизно "
+                    f"{best['stop_count']} зуп."
+                ),
+                "",
+                "4️⃣ ДЕ ВИХОДИТИ",
+                (
+                    f"🚏 «{best['destination']['name']}»"
+                ),
+                (
+                    f"🚶 Потім ще "
+                    f"{round(best['destination']['distance'])} м "
+                    f"≈ {walking_minutes(best['destination']['distance'])} хв"
+                ),
+            ]
+        )
+
+        # ------------------------------------------
+        # ALTERNATIVES
+        # ------------------------------------------
+
+        alternatives = (
+            options[1:3]
+        )
 
         if alternatives:
 
             lines.extend(
                 [
                     "",
-                    "🔄 Ще варіанти:",
+                    "━━━━━━━━━━━━━━",
+                    "🔄 ЩЕ ВАРІАНТИ",
                 ]
             )
 
-            for item in alternatives:
+            for alternative in alternatives:
 
-                lines.append(
-                    f"• №{item['route']['number']} — "
-                    f"{seconds_to_clock(item['departure'])}, "
-                    f"≈ {format_minutes(item['total_minutes'])}"
+                alt_route = (
+                    alternative[
+                        "route"
+                    ]
                 )
 
-        await message.answer(
-            "\n".join(lines)
+                alt_live = (
+                    alternative[
+                        "live"
+                    ]
+                )
+
+                if (
+                    alt_live
+                    and alt_live[
+                        "count"
+                    ] > 0
+                ):
+                    live_mark = (
+                        f"🟢 {alt_live['count']} GPS"
+                    )
+                else:
+                    live_mark = "⚪ без GPS"
+
+                lines.append(
+                    f"• №{alt_route['number']} — "
+                    f"{round(alternative['origin']['distance'])} м "
+                    f"до посадки, {live_mark}"
+                )
+
+        lines.extend(
+            [
+                "",
+                "━━━━━━━━━━━━━━",
+                "🛰 Дані транспорту перевірені наживо.",
+            ]
         )
+
+        await message.answer(
+            "\n".join(
+                lines
+            ),
+            reply_markup=new_route_keyboard,
+        )
+
+        users[
+            user_id
+        ]["step"] = "done"
 
         return
 
     await message.answer(
-        "🧭 Хочеш прокласти новий маршрут?\n"
-        "Натисни /start"
+        "🧭 Готовий прокласти ще один маршрут.",
+        reply_markup=new_route_keyboard,
     )
 
 
@@ -1918,24 +1829,35 @@ async def text_handler(message: Message):
 # ==================================================
 
 async def main():
-
     print(
-        "MENI-TUDY GPS DEBUG START",
+        "MENI-TUDY LIVE GPS START",
         flush=True,
     )
 
-    await load_gtfs()
+    loaded = (
+        await load_gtfs()
+    )
+
+    if not loaded:
+        print(
+            "WARNING: GTFS NOT LOADED",
+            flush=True,
+        )
 
     print(
-        "MENI-TUDY POLLING START",
+        "BOT POLLING START",
         flush=True,
     )
 
     await dp.start_polling(
         bot,
-        allowed_updates=["message"],
+        allowed_updates=[
+            "message"
+        ],
     )
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(
+        main()
+    )
