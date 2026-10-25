@@ -37,15 +37,9 @@ DEVICES_URL = "https://city.dozor.tech/ua/iv-frankivsk/devices.json"
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
 MAX_GPS_AGE_SECONDS = 5 * 60
-MAX_WALK_METERS = 850
-
-# Машина повинна бути достатньо близько
-# до траєкторії потрібного напрямку.
+MAX_WALK_METERS = 900
 MAX_ROUTE_MATCH_METERS = 550
 
-# Для приблизного ETA.
-# Не використовуємо миттєву GPS-швидкість як єдине джерело,
-# бо автобус часто стоїть на світлофорі/зупинці.
 DEFAULT_CITY_SPEED_KMH = 18.0
 
 users = {}
@@ -79,16 +73,21 @@ start_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
-new_route_keyboard = ReplyKeyboardMarkup(
+route_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [
             KeyboardButton(
-                text="🧭 Новий маршрут",
+                text="🛰 Де зараз транспорт?"
             )
         ],
         [
             KeyboardButton(
-                text="📍 Оновити геолокацію",
+                text="🧭 Новий маршрут"
+            )
+        ],
+        [
+            KeyboardButton(
+                text="📍 Оновити мою геолокацію",
                 request_location=True,
             )
         ],
@@ -98,8 +97,12 @@ new_route_keyboard = ReplyKeyboardMarkup(
 
 
 # ==================================================
-# GEO HELPERS
+# BASIC HELPERS
 # ==================================================
+
+def now():
+    return datetime.now(KYIV_TZ)
+
 
 def distance_meters(lat1, lon1, lat2, lon2):
     radius = 6371000
@@ -124,14 +127,38 @@ def distance_meters(lat1, lon1, lat2, lon2):
 
 
 def walking_minutes(distance):
-    return max(
-        1,
-        round(distance / 80),
-    )
+    return max(1, round(distance / 80))
 
 
-def current_time():
-    return datetime.now(KYIV_TZ)
+def format_distance(distance):
+    if distance < 1000:
+        return f"{round(distance)} м"
+
+    return f"{distance / 1000:.1f} км"
+
+
+def format_age(seconds):
+    seconds = max(0, int(seconds))
+
+    if seconds < 60:
+        return f"{seconds} с тому"
+
+    return f"{seconds // 60} хв тому"
+
+
+def plural_stops(number):
+    number = abs(int(number))
+
+    if number % 10 == 1 and number % 100 != 11:
+        return "зупинка"
+
+    if (
+        number % 10 in (2, 3, 4)
+        and number % 100 not in (12, 13, 14)
+    ):
+        return "зупинки"
+
+    return "зупинок"
 
 
 def parse_gps_time(value):
@@ -144,17 +171,15 @@ def parse_gps_time(value):
             "%Y-%m-%d %H:%M:%S",
         )
 
-        return dt.replace(
-            tzinfo=KYIV_TZ
-        )
+        return dt.replace(tzinfo=KYIV_TZ)
 
     except Exception:
         return None
 
 
-def default_headers():
+def headers():
     return {
-        "User-Agent": "MeniTudyTelegramBot/3.0",
+        "User-Agent": "MeniTudyTelegramBot/4.0",
         "Accept": "*/*",
     }
 
@@ -177,7 +202,7 @@ async def geocode_address(address):
 
     try:
         async with aiohttp.ClientSession(
-            headers=default_headers(),
+            headers=headers(),
             timeout=timeout,
         ) as session:
 
@@ -205,7 +230,7 @@ async def geocode_address(address):
 
     except Exception as error:
         print(
-            f"GEOCODING ERROR: {error}",
+            f"GEOCODING ERROR: {repr(error)}",
             flush=True,
         )
         return None
@@ -217,6 +242,7 @@ async def geocode_address(address):
 
 def read_csv(archive, filename):
     with archive.open(filename) as raw:
+
         text = io.TextIOWrapper(
             raw,
             encoding="utf-8-sig",
@@ -227,7 +253,7 @@ def read_csv(archive, filename):
 
 
 # ==================================================
-# GTFS
+# GTFS LOAD
 # ==================================================
 
 async def load_gtfs():
@@ -237,22 +263,17 @@ async def load_gtfs():
     global trip_sequences
     global stop_to_trips
 
-    print(
-        "GTFS DOWNLOAD START",
-        flush=True,
-    )
+    print("GTFS DOWNLOAD START", flush=True)
 
     timeout = aiohttp.ClientTimeout(total=60)
 
     try:
         async with aiohttp.ClientSession(
-            headers=default_headers(),
+            headers=headers(),
             timeout=timeout,
         ) as session:
 
-            async with session.get(
-                GTFS_URL
-            ) as response:
+            async with session.get(GTFS_URL) as response:
 
                 if response.status != 200:
                     print(
@@ -267,9 +288,7 @@ async def load_gtfs():
             io.BytesIO(content)
         )
 
-        # ------------------------------------------
-        # STOPS
-        # ------------------------------------------
+        # ---------------- STOPS ----------------
 
         new_stops = {}
 
@@ -294,9 +313,7 @@ async def load_gtfs():
 
         stops = new_stops
 
-        # ------------------------------------------
-        # ROUTES
-        # ------------------------------------------
+        # ---------------- ROUTES ----------------
 
         new_routes = {}
 
@@ -326,9 +343,7 @@ async def load_gtfs():
 
         routes = new_routes
 
-        # ------------------------------------------
-        # TRIPS
-        # ------------------------------------------
+        # ---------------- TRIPS ----------------
 
         new_trips = {}
 
@@ -358,21 +373,11 @@ async def load_gtfs():
 
         trips = new_trips
 
-        # ------------------------------------------
-        # STOP_TIMES
-        #
-        # Тримаємо тільки:
-        # (sequence, stop_id)
-        #
-        # Це значно легше для RAM.
-        # ------------------------------------------
+        # ---------------- STOP TIMES ----------------
+        # Тільки stop_sequence + stop_id.
+        # Не тримаємо весь CSV у RAM.
 
         new_sequences = defaultdict(list)
-
-        print(
-            "READING STOP_TIMES...",
-            flush=True,
-        )
 
         with archive.open(
             "stop_times.txt"
@@ -413,9 +418,7 @@ async def load_gtfs():
                     )
                 )
 
-        # ------------------------------------------
-        # INDEX
-        # ------------------------------------------
+        # ---------------- INDEX ----------------
 
         new_stop_to_trips = defaultdict(list)
 
@@ -425,9 +428,8 @@ async def load_gtfs():
                 key=lambda x: x[0]
             )
 
-            for position, item in enumerate(
-                sequence
-            ):
+            for position, item in enumerate(sequence):
+
                 stop_id = item[1]
 
                 new_stop_to_trips[
@@ -443,24 +445,29 @@ async def load_gtfs():
         stop_to_trips = new_stop_to_trips
 
         archive.close()
+
         del content
 
         print(
             "GTFS READY:",
-            f"{len(stops)} stops,",
-            f"{len(routes)} routes,",
-            f"{len(trips)} trips,",
-            f"{len(trip_sequences)} sequences",
+            len(stops),
+            "stops,",
+            len(routes),
+            "routes,",
+            len(trips),
+            "trips",
             flush=True,
         )
 
         return True
 
     except Exception as error:
+
         print(
             f"GTFS ERROR: {repr(error)}",
             flush=True,
         )
+
         return False
 
 
@@ -473,7 +480,7 @@ async def get_live_vehicles():
 
     try:
         async with aiohttp.ClientSession(
-            headers=default_headers(),
+            headers=headers(),
             timeout=timeout,
         ) as session:
 
@@ -493,7 +500,8 @@ async def get_live_vehicles():
         if not isinstance(data, list):
             return []
 
-        now = current_time()
+        current = now()
+
         result = []
 
         for item in data:
@@ -521,7 +529,7 @@ async def get_live_vehicles():
                 continue
 
             age = (
-                now - gps_time
+                current - gps_time
             ).total_seconds()
 
             if (
@@ -579,31 +587,30 @@ async def get_live_vehicles():
                     "time": gps_time,
                     "age": age,
                     "speed": speed,
-                    "satellites": item.get(
-                        "satellites"
-                    ),
                 }
             )
 
         return result
 
     except Exception as error:
+
         print(
             f"GPS ERROR: {repr(error)}",
             flush=True,
         )
+
         return []
 
 
 # ==================================================
-# STOPS
+# NEARBY STOPS
 # ==================================================
 
 def nearby_stops(
     latitude,
     longitude,
-    radius=1000,
-    limit=25,
+    radius=1100,
+    limit=28,
 ):
     result = []
 
@@ -741,52 +748,22 @@ def find_direct_routes(
                     - origin_position
                 )
 
-                total_walk = (
-                    origin["distance"]
-                    + destination["distance"]
-                )
-
-                # Базовий рейтинг без GPS.
-                #
-                # Ходьба після виходу карається
-                # сильніше, ніж кількість зупинок.
-                score = (
-                    origin["distance"] * 1.1
-                    + destination["distance"] * 1.5
-                    + stop_count * 22
-                )
-
-                if origin["distance"] > 450:
-                    score += 250
-
-                if destination["distance"] > 450:
-                    score += 400
-
-                if destination["distance"] > 650:
-                    score += 500
-
                 candidates.append(
                     {
-                        "score": score,
                         "route": info,
                         "trip_id": trip_id,
                         "origin": origin,
                         "destination": destination,
                         "origin_position": origin_position,
-                        "destination_position": (
-                            destination_position
-                        ),
+                        "destination_position": destination_position,
                         "stop_count": stop_count,
                     }
                 )
 
                 break
 
-    # Тут важливо НЕ залишати лише один trip
-    # на route_id занадто рано.
-    #
-    # Один номер маршруту може мати
-    # різні напрямки.
+    # Прибираємо дублікати однакових варіантів.
+
     best = {}
 
     for item in candidates:
@@ -798,25 +775,26 @@ def find_direct_routes(
             item["destination"]["id"],
         )
 
-        previous = best.get(key)
+        old = best.get(key)
+
+        base_score = (
+            item["origin"]["distance"]
+            + item["destination"]["distance"] * 1.8
+            + item["stop_count"] * 20
+        )
 
         if (
-            previous is None
-            or item["score"] < previous["score"]
+            old is None
+            or base_score < old["_base_score"]
         ):
+            item["_base_score"] = base_score
             best[key] = item
 
-    result = list(best.values())
-
-    result.sort(
-        key=lambda x: x["score"]
-    )
-
-    return result
+    return list(best.values())
 
 
 # ==================================================
-# VEHICLE / ROUTE MATCHING
+# VEHICLE MATCHING
 # ==================================================
 
 def vehicle_matches_route(
@@ -830,23 +808,9 @@ def vehicle_matches_route(
         )
     ).strip()
 
-    vehicle_number = str(
-        vehicle.get(
-            "route_short_name",
-            "",
-        )
-    ).strip()
-
     route_id = str(
         route.get(
             "route_id",
-            "",
-        )
-    ).strip()
-
-    route_number = str(
-        route.get(
-            "number",
             "",
         )
     ).strip()
@@ -858,23 +822,28 @@ def vehicle_matches_route(
     ):
         return True
 
-    if (
-        vehicle_number
-        and route_number
+    vehicle_number = str(
+        vehicle.get(
+            "route_short_name",
+            "",
+        )
+    ).strip()
+
+    route_number = str(
+        route.get(
+            "number",
+            "",
+        )
+    ).strip()
+
+    return (
+        bool(vehicle_number)
+        and bool(route_number)
         and vehicle_number == route_number
-    ):
-        return True
-
-    return False
+    )
 
 
-# ==================================================
-# SEQUENCE HELPERS
-# ==================================================
-
-def get_sequence_stop_data(
-    trip_id
-):
+def get_sequence_stop_data(trip_id):
     sequence = trip_sequences.get(
         trip_id,
         [],
@@ -886,22 +855,20 @@ def get_sequence_stop_data(
 
         stop_id = item[1]
 
-        stop = stops.get(
-            stop_id
-        )
+        stop = stops.get(stop_id)
 
         if not stop:
             continue
 
-        name, lat, lon = stop
+        name, latitude, longitude = stop
 
         result.append(
             {
                 "index": index,
                 "stop_id": stop_id,
                 "name": name,
-                "latitude": lat,
-                "longitude": lon,
+                "latitude": latitude,
+                "longitude": longitude,
             }
         )
 
@@ -944,14 +911,10 @@ def distance_along_stops(
 ):
     sequence = trip_sequences.get(
         trip_id,
-        []
+        [],
     )
 
-    if (
-        start_position >= end_position
-        or start_position < 0
-        or end_position >= len(sequence)
-    ):
+    if start_position >= end_position:
         return 0
 
     total = 0
@@ -960,11 +923,16 @@ def distance_along_stops(
         start_position,
         end_position,
     ):
-        stop_a_id = sequence[index][1]
-        stop_b_id = sequence[index + 1][1]
+        if index + 1 >= len(sequence):
+            break
 
-        stop_a = stops.get(stop_a_id)
-        stop_b = stops.get(stop_b_id)
+        stop_a = stops.get(
+            sequence[index][1]
+        )
+
+        stop_b = stops.get(
+            sequence[index + 1][1]
+        )
 
         if not stop_a or not stop_b:
             continue
@@ -984,27 +952,25 @@ def distance_along_stops(
 # ==================================================
 
 def estimate_eta_minutes(
-    route_distance_meters,
-    vehicle_speed,
+    route_distance,
+    speed,
+    stops_before,
 ):
-    # GPS speed 0 не означає, що автобус
-    # реально стоятиме весь час.
-    #
-    # Якщо він рухається нормально,
-    # трохи враховуємо фактичну швидкість,
-    # але обмежуємо її розумним діапазоном.
+    # Миттєва швидкість GPS дуже нестабільна.
+    # Використовуємо її лише як допоміжний сигнал.
 
-    if vehicle_speed >= 7:
+    if speed >= 8:
 
-        effective_speed = min(
-            28,
-            max(
-                14,
-                vehicle_speed * 0.75,
+        effective_speed = max(
+            15,
+            min(
+                25,
+                speed * 0.75,
             ),
         )
 
     else:
+
         effective_speed = (
             DEFAULT_CITY_SPEED_KMH
         )
@@ -1015,51 +981,52 @@ def estimate_eta_minutes(
         / 60
     )
 
-    moving_minutes = (
-        route_distance_meters
+    drive_minutes = (
+        route_distance
         / meters_per_minute
     )
 
-    # Додаємо запас на зупинки,
-    # світлофори та посадку.
+    # Додатковий час на зупинки/світлофори.
+    stop_delay = min(
+        4,
+        stops_before * 0.35,
+    )
+
     estimated = (
-        moving_minutes * 1.22
-        + 0.8
+        drive_minutes * 1.12
+        + stop_delay
+        + 0.5
     )
 
     estimated = max(
-        1,
+        1.0,
         estimated,
     )
 
     low = max(
         1,
         math.floor(
-            estimated * 0.78
+            estimated * 0.82
         ),
     )
 
     high = max(
         low + 1,
         math.ceil(
-            estimated * 1.28
+            estimated * 1.22
         ),
     )
 
-    return (
-        low,
-        high,
-        estimated,
-    )
+    return low, high, estimated
 
 
 # ==================================================
-# ANALYZE LIVE VEHICLES
+# LIVE ROUTE ANALYSIS
 # ==================================================
 
 def analyze_live_route(
     candidate,
-    all_vehicles,
+    vehicles,
 ):
     route = candidate["route"]
     trip_id = candidate["trip_id"]
@@ -1074,25 +1041,18 @@ def analyze_live_route(
         )
     )
 
-    matching_vehicles = [
+    matching = [
         vehicle
-        for vehicle in all_vehicles
+        for vehicle in vehicles
         if vehicle_matches_route(
             vehicle,
             route,
         )
     ]
 
-    if not matching_vehicles:
-        return {
-            "route_vehicle_count": 0,
-            "approaching_count": 0,
-            "best_vehicle": None,
-        }
-
     approaching = []
 
-    for vehicle in matching_vehicles:
+    for vehicle in matching:
 
         nearest = (
             nearest_sequence_position(
@@ -1104,8 +1064,6 @@ def analyze_live_route(
         if not nearest:
             continue
 
-        # Машина надто далеко від зупинок
-        # цього конкретного напрямку.
         if (
             nearest["distance"]
             > MAX_ROUTE_MATCH_METERS
@@ -1116,14 +1074,9 @@ def analyze_live_route(
             "index"
         ]
 
-        # Якщо найближча точка маршруту вже
-        # після посадкової зупинки,
-        # цю машину не вважаємо тією,
-        # що наближається.
-        if (
-            vehicle_position
-            > origin_position
-        ):
+        # Машина вже далі за нашу посадкову
+        # зупинку у цій послідовності.
+        if vehicle_position > origin_position:
             continue
 
         stops_before = (
@@ -1139,37 +1092,28 @@ def analyze_live_route(
             )
         )
 
-        # Додаємо відстань від GPS-машини
-        # до найближчої GTFS-зупинки.
         route_distance += nearest[
             "distance"
         ]
 
-        eta_low, eta_high, eta_mid = (
+        low, high, middle = (
             estimate_eta_minutes(
                 route_distance,
                 vehicle["speed"],
+                stops_before,
             )
         )
 
         approaching.append(
             {
                 "vehicle": vehicle,
-                "nearest_route_stop": (
-                    nearest
-                ),
-                "vehicle_position": (
-                    vehicle_position
-                ),
-                "stops_before": (
-                    stops_before
-                ),
-                "route_distance": (
-                    route_distance
-                ),
-                "eta_low": eta_low,
-                "eta_high": eta_high,
-                "eta_mid": eta_mid,
+                "nearest_route_stop": nearest,
+                "vehicle_position": vehicle_position,
+                "stops_before": stops_before,
+                "route_distance": route_distance,
+                "eta_low": low,
+                "eta_high": high,
+                "eta_mid": middle,
             }
         )
 
@@ -1182,7 +1126,7 @@ def analyze_live_route(
 
     return {
         "route_vehicle_count": len(
-            matching_vehicles
+            matching
         ),
         "approaching_count": len(
             approaching
@@ -1196,7 +1140,41 @@ def analyze_live_route(
 
 
 # ==================================================
-# ROUTE RANKING
+# WALK PENALTY
+# ==================================================
+
+def destination_walk_penalty(meters):
+    """
+    Довга ходьба ПІСЛЯ транспорту
+    повинна суттєво погіршувати маршрут.
+    """
+
+    if meters <= 300:
+        return 0
+
+    if meters <= 500:
+        return (
+            (meters - 300)
+            / 100
+        )
+
+    if meters <= 700:
+        return (
+            2
+            + (meters - 500)
+            / 40
+        )
+
+    # 700+ метрів — вже слабкий варіант.
+    return (
+        7
+        + (meters - 700)
+        / 20
+    )
+
+
+# ==================================================
+# BUILD ROUTES
 # ==================================================
 
 async def build_route_result(
@@ -1204,28 +1182,30 @@ async def build_route_result(
     origin_stops,
     destination_stops,
 ):
-    direct_routes = find_direct_routes(
+    candidates = find_direct_routes(
         origin_stops,
         destination_stops,
     )
 
-    if not direct_routes:
+    if not candidates:
         return None
 
     vehicles = await get_live_vehicles()
 
     enriched = []
 
-    # Аналізуємо обмежену кількість,
-    # щоб не навантажувати 128 MB / CPU.
-    for candidate in direct_routes[:15]:
+    # Не аналізуємо нескінченну кількість
+    # варіантів на слабкому сервері.
+    candidates.sort(
+        key=lambda x: x["_base_score"]
+    )
+
+    for candidate in candidates[:20]:
 
         live = analyze_live_route(
             candidate,
             vehicles,
         )
-
-        candidate["live"] = live
 
         walk_to = walking_minutes(
             candidate[
@@ -1239,14 +1219,12 @@ async def build_route_result(
             ]["distance"]
         )
 
-        # Орієнтовний час самої поїздки.
-        # Тут нам важливіше ранжування,
-        # а не показ "точного" часу.
-        ride_estimate = max(
-            4,
+        # Орієнтовний час поїздки.
+        ride_minutes = max(
+            3,
             candidate[
                 "stop_count"
-            ] * 1.6,
+            ] * 1.45,
         )
 
         best_vehicle = live.get(
@@ -1255,74 +1233,83 @@ async def build_route_result(
 
         if best_vehicle:
 
-            wait_estimate = (
+            wait_minutes = (
                 best_vehicle[
                     "eta_mid"
                 ]
             )
 
-            has_approaching_vehicle = True
+            gps_penalty = 0
+
+        elif live[
+            "route_vehicle_count"
+        ] > 0:
+
+            # GPS є, але потрібний напрямок
+            # не підтверджений.
+            wait_minutes = 12
+            gps_penalty = 7
 
         else:
 
-            # Якщо GPS потрібного напрямку
-            # не підтверджений — не вигадуємо
-            # очікування, а даємо штраф.
-            wait_estimate = 12
-            has_approaching_vehicle = False
+            # Немає свіжого GPS.
+            wait_minutes = 14
+            gps_penalty = 10
 
-        total_estimate = (
+        total_minutes = (
             walk_to
-            + wait_estimate
-            + ride_estimate
+            + wait_minutes
+            + ride_minutes
             + walk_after
         )
 
-        # Рейтинг:
-        # час + додатковий штраф за ходьбу.
-        final_score = (
-            total_estimate
-            + walk_to * 0.5
-            + walk_after * 1.0
+        walk_penalty = (
+            destination_walk_penalty(
+                candidate[
+                    "destination"
+                ]["distance"]
+            )
         )
 
-        if not has_approaching_vehicle:
-            final_score += 8
+        # Початкова ходьба теж має значення,
+        # але ходьба після виходу важливіша.
+        origin_penalty = 0
 
         if (
             candidate[
-                "destination"
+                "origin"
             ]["distance"]
             > 500
         ):
-            final_score += 5
+            origin_penalty += 5
 
-        candidate[
-            "walk_to_minutes"
-        ] = walk_to
+        if (
+            candidate[
+                "origin"
+            ]["distance"]
+            > 700
+        ):
+            origin_penalty += 6
 
-        candidate[
-            "walk_after_minutes"
-        ] = walk_after
-
-        candidate[
-            "ride_estimate"
-        ] = ride_estimate
-
-        candidate[
-            "total_estimate"
-        ] = total_estimate
-
-        candidate[
-            "final_score"
-        ] = final_score
-
-        enriched.append(
-            candidate
+        final_score = (
+            total_minutes
+            + walk_penalty
+            + origin_penalty
+            + gps_penalty
         )
 
-    # Залишаємо один найкращий
-    # напрямок кожного номера маршруту.
+        candidate["live"] = live
+        candidate["walk_to_minutes"] = walk_to
+        candidate["walk_after_minutes"] = walk_after
+        candidate["ride_minutes"] = ride_minutes
+        candidate["wait_minutes"] = wait_minutes
+        candidate["total_minutes"] = total_minutes
+        candidate["final_score"] = final_score
+
+        enriched.append(candidate)
+
+    # Один найкращий варіант на номер маршруту.
+
     best_by_number = {}
 
     for item in enriched:
@@ -1331,73 +1318,538 @@ async def build_route_result(
             "route"
         ]["number"]
 
-        previous = best_by_number.get(
+        old = best_by_number.get(
             number
         )
 
         if (
-            previous is None
+            old is None
             or item["final_score"]
-            < previous["final_score"]
+            < old["final_score"]
         ):
-            best_by_number[
-                number
-            ] = item
+            best_by_number[number] = item
 
-    final_routes = list(
+    result = list(
         best_by_number.values()
     )
 
-    final_routes.sort(
-        key=lambda x: x[
-            "final_score"
-        ]
+    result.sort(
+        key=lambda x: x["final_score"]
     )
 
     return {
         "destination": destination_text,
-        "vehicles_total": len(
-            vehicles
-        ),
-        "routes": final_routes,
+        "routes": result,
+        "updated_at": now(),
     }
 
 
 # ==================================================
-# FORMAT HELPERS
+# WHEN TO LEAVE
 # ==================================================
 
-def format_gps_age(seconds):
-    seconds = max(
-        0,
-        int(seconds),
+def leave_advice(
+    eta_low,
+    eta_high,
+    walk_minutes,
+):
+    # Використовуємо нижню межу ETA,
+    # щоб не радити вийти запізно.
+    #
+    # 1 хв запасу для дуже близької зупинки,
+    # 2 хв — для довшої ходьби.
+
+    buffer_minutes = (
+        1
+        if walk_minutes <= 2
+        else 2
     )
 
-    if seconds < 60:
-        return f"{seconds} с тому"
+    leave_in = (
+        eta_low
+        - walk_minutes
+        - buffer_minutes
+    )
+
+    if leave_in <= 0:
+
+        return (
+            "⚡ ВИХОДЬ ЗАРАЗ\n"
+            "Автобус уже достатньо близько."
+        )
+
+    if leave_in == 1:
+
+        return (
+            "⚡ Збирайся виходити\n"
+            "Орієнтовно через 1 хв вже варто йти."
+        )
 
     return (
-        f"{seconds // 60} хв тому"
+        f"⚡ Можеш виходити приблизно "
+        f"через {leave_in} хв\n"
+        f"🚶 До зупинки ≈ {walk_minutes} хв."
     )
 
 
-def format_distance(meters):
-    if meters < 1000:
-        return f"{round(meters)} м"
+# ==================================================
+# FORMAT MAIN ROUTE
+# ==================================================
 
-    return (
-        f"{meters / 1000:.1f} км"
+def format_route_result(
+    destination_text,
+    options,
+    updated_at,
+):
+    best = options[0]
+
+    route = best["route"]
+    live = best["live"]
+
+    lines = [
+        "⚡ НАЙКРАЩИЙ ВАРІАНТ",
+        "━━━━━━━━━━━━━━",
+        f"🏁 {destination_text}",
+        "",
+        f"🚌 Маршрут №{route['number']}",
+    ]
+
+    if route.get("headsign"):
+
+        lines.append(
+            f"➡️ {route['headsign']}"
+        )
+
+    lines.extend(
+        [
+            "",
+            "🚶 ДО ЗУПИНКИ",
+            (
+                f"«{best['origin']['name']}» — "
+                f"{round(best['origin']['distance'])} м"
+            ),
+            (
+                f"≈ {best['walk_to_minutes']} хв пішки"
+            ),
+            "",
+            "🛰 ТРАНСПОРТ НАЖИВО",
+        ]
     )
 
+    vehicle_info = live.get(
+        "best_vehicle"
+    )
 
-def plural_stops(number):
-    if number == 1:
-        return "зупинка"
+    if vehicle_info:
 
-    if 2 <= number <= 4:
-        return "зупинки"
+        vehicle = vehicle_info[
+            "vehicle"
+        ]
 
-    return "зупинок"
+        stops_before = vehicle_info[
+            "stops_before"
+        ]
+
+        lines.append(
+            f"🟢 Машина №"
+            f"{vehicle['gov_number'] or '—'} "
+            "ймовірно рухається до твоєї зупинки."
+        )
+
+        lines.append(
+            f"📍 Зараз біля "
+            f"«{vehicle_info['nearest_route_stop']['name']}»"
+        )
+
+        if stops_before == 0:
+
+            lines.append(
+                "🚏 Вона вже в районі "
+                "твоєї зупинки."
+            )
+
+        else:
+
+            lines.append(
+                f"🚏 До тебе ще приблизно "
+                f"{stops_before} "
+                f"{plural_stops(stops_before)}"
+            )
+
+        lines.append(
+            f"📏 По маршруту ≈ "
+            f"{format_distance(vehicle_info['route_distance'])}"
+        )
+
+        lines.append(
+            f"⏱ Очікування: "
+            f"≈ {vehicle_info['eta_low']}–"
+            f"{vehicle_info['eta_high']} хв"
+        )
+
+        lines.append(
+            f"🕒 GPS: "
+            f"{format_age(vehicle['age'])}"
+        )
+
+        lines.append("")
+
+        lines.append(
+            leave_advice(
+                vehicle_info[
+                    "eta_low"
+                ],
+                vehicle_info[
+                    "eta_high"
+                ],
+                best[
+                    "walk_to_minutes"
+                ],
+            )
+        )
+
+    elif live[
+        "route_vehicle_count"
+    ] > 0:
+
+        lines.extend(
+            [
+                (
+                    f"🟡 На маршруті №{route['number']} "
+                    "GPS працює."
+                ),
+                (
+                    "Але зараз не бачу машини, "
+                    "яку можу достатньо надійно "
+                    "визначити як таку, що наближається."
+                ),
+            ]
+        )
+
+    else:
+
+        lines.append(
+            f"⚪ Свіжої GPS-позиції "
+            f"маршруту №{route['number']} "
+            "зараз не бачу."
+        )
+
+    lines.extend(
+        [
+            "",
+            "🚌 ПОЇЗДКА",
+            (
+                f"Їхати приблизно "
+                f"{best['stop_count']} "
+                f"{plural_stops(best['stop_count'])}"
+            ),
+            "",
+            "🚏 ДЕ ВИХОДИТИ",
+            f"«{best['destination']['name']}»",
+            (
+                f"🚶 До адреси ще "
+                f"{round(best['destination']['distance'])} м "
+                f"≈ {best['walk_after_minutes']} хв"
+            ),
+        ]
+    )
+
+    if vehicle_info:
+
+        approximate_total = round(
+            best["total_minutes"]
+        )
+
+        lines.extend(
+            [
+                "",
+                (
+                    f"⏱ Увесь шлях орієнтовно: "
+                    f"~{approximate_total} хв"
+                ),
+            ]
+        )
+
+    alternatives = options[1:3]
+
+    if alternatives:
+
+        lines.extend(
+            [
+                "",
+                "━━━━━━━━━━━━━━",
+                "🔄 ЩЕ ВАРІАНТИ",
+            ]
+        )
+
+        for alternative in alternatives:
+
+            alt_route = alternative[
+                "route"
+            ]
+
+            alt_live = alternative[
+                "live"
+            ]
+
+            alt_vehicle = alt_live.get(
+                "best_vehicle"
+            )
+
+            if alt_vehicle:
+
+                status = (
+                    f"🟢 {alt_vehicle['eta_low']}–"
+                    f"{alt_vehicle['eta_high']} хв"
+                )
+
+            elif (
+                alt_live[
+                    "route_vehicle_count"
+                ] > 0
+            ):
+
+                status = "🟡 GPS є"
+
+            else:
+
+                status = "⚪ без GPS"
+
+            lines.append(
+                f"• №{alt_route['number']} — "
+                f"{round(alternative['origin']['distance'])} м "
+                f"до посадки / "
+                f"{round(alternative['destination']['distance'])} м "
+                f"після виходу / "
+                f"{status}"
+            )
+
+    lines.extend(
+        [
+            "",
+            "━━━━━━━━━━━━━━",
+            (
+                f"🕒 Оновлено: "
+                f"{updated_at.strftime('%H:%M:%S')}"
+            ),
+            "",
+            "Натисни «🛰 Де зараз транспорт?» — "
+            "і я перевірю його ще раз.",
+        ]
+    )
+
+    return "\n".join(lines)
+
+
+# ==================================================
+# LIVE REFRESH
+# ==================================================
+
+async def refresh_saved_route(
+    user_data,
+):
+    saved = user_data.get(
+        "selected_route"
+    )
+
+    if not saved:
+        return None
+
+    vehicles = await get_live_vehicles()
+
+    # Копіювати весь маршрут не потрібно.
+    # Перераховуємо лише live-частину.
+    live = analyze_live_route(
+        saved,
+        vehicles,
+    )
+
+    saved["live"] = live
+
+    best_vehicle = live.get(
+        "best_vehicle"
+    )
+
+    if best_vehicle:
+
+        saved["wait_minutes"] = (
+            best_vehicle[
+                "eta_mid"
+            ]
+        )
+
+    saved["total_minutes"] = (
+        saved.get(
+            "walk_to_minutes",
+            0,
+        )
+        + saved.get(
+            "wait_minutes",
+            0,
+        )
+        + saved.get(
+            "ride_minutes",
+            0,
+        )
+        + saved.get(
+            "walk_after_minutes",
+            0,
+        )
+    )
+
+    return {
+        "route": saved,
+        "updated_at": now(),
+    }
+
+
+def format_live_refresh(
+    route_data,
+    updated_at,
+):
+    route = route_data[
+        "route"
+    ]
+
+    live = route_data[
+        "live"
+    ]
+
+    lines = [
+        "🛰 ДЕ ЗАРАЗ ТРАНСПОРТ?",
+        "━━━━━━━━━━━━━━",
+        (
+            f"🚌 Маршрут №"
+            f"{route['number']}"
+        ),
+        (
+            f"🚏 Твоя зупинка: "
+            f"«{route_data['origin']['name']}»"
+        ),
+        "",
+    ]
+
+    vehicle_info = live.get(
+        "best_vehicle"
+    )
+
+    if vehicle_info:
+
+        vehicle = vehicle_info[
+            "vehicle"
+        ]
+
+        stops_before = vehicle_info[
+            "stops_before"
+        ]
+
+        lines.append(
+            f"🟢 Машина №"
+            f"{vehicle['gov_number'] or '—'}"
+        )
+
+        lines.append(
+            f"📍 Зараз біля "
+            f"«{vehicle_info['nearest_route_stop']['name']}»"
+        )
+
+        if stops_before == 0:
+
+            lines.append(
+                "🚏 Вона вже біля твоєї зупинки."
+            )
+
+        else:
+
+            lines.append(
+                f"🚏 До тебе ще ≈ "
+                f"{stops_before} "
+                f"{plural_stops(stops_before)}"
+            )
+
+        lines.append(
+            f"📏 Залишилось по маршруту ≈ "
+            f"{format_distance(vehicle_info['route_distance'])}"
+        )
+
+        lines.append(
+            f"⏱ Прибуття: ≈ "
+            f"{vehicle_info['eta_low']}–"
+            f"{vehicle_info['eta_high']} хв"
+        )
+
+        if vehicle[
+            "speed"
+        ] > 0:
+
+            lines.append(
+                f"💨 Швидкість зараз: "
+                f"{round(vehicle['speed'])} км/год"
+            )
+
+        lines.append(
+            f"🕒 GPS: "
+            f"{format_age(vehicle['age'])}"
+        )
+
+        lines.extend(
+            [
+                "",
+                leave_advice(
+                    vehicle_info[
+                        "eta_low"
+                    ],
+                    vehicle_info[
+                        "eta_high"
+                    ],
+                    route_data[
+                        "walk_to_minutes"
+                    ],
+                ),
+            ]
+        )
+
+    elif live[
+        "route_vehicle_count"
+    ] > 0:
+
+        lines.extend(
+            [
+                "🟡 GPS маршруту працює,",
+                (
+                    "але зараз не можу надійно "
+                    "визначити машину, яка "
+                    "наближається саме до твоєї зупинки."
+                ),
+            ]
+        )
+
+    else:
+
+        lines.extend(
+            [
+                (
+                    f"⚪ Свіжої GPS-позиції "
+                    f"маршруту №{route['number']} "
+                    "зараз немає."
+                ),
+                "",
+                "Спробуй перевірити ще раз трохи пізніше.",
+            ]
+        )
+
+    lines.extend(
+        [
+            "",
+            "━━━━━━━━━━━━━━",
+            (
+                f"🕒 Перевірено: "
+                f"{updated_at.strftime('%H:%M:%S')}"
+            ),
+        ]
+    )
+
+    return "\n".join(lines)
 
 
 # ==================================================
@@ -1420,12 +1872,13 @@ async def start_handler(
         "Твій транспортний помічник "
         "в Івано-Франківську ⚡\n\n"
         "Скажи, звідки вирушаєш — "
-        "я спробую знайти найзручніший шлях.\n\n"
+        "я допоможу знайти зручний транспорт.\n\n"
         "📍 знайду найближчу зупинку\n"
-        "🚌 підберу транспорт\n"
-        "🛰 перевірю машини наживо\n"
-        "⏱ оцінимо, скільки чекати\n"
-        "🚏 скажу, де виходити\n\n"
+        "🚌 підберу маршрут\n"
+        "🛰 знайду транспорт наживо\n"
+        "⏱ оцінимо, коли він буде\n"
+        "⚡ підкажу, коли виходити\n"
+        "🚏 скажу, де вийти\n\n"
         "Звідки стартуємо? 👇",
         reply_markup=start_keyboard,
     )
@@ -1472,8 +1925,8 @@ async def location_handler(
             f"«{nearest['name']}»\n"
             f"🚶 {round(nearest['distance'])} м "
             f"≈ {walking_minutes(nearest['distance'])} хв\n\n"
-            "Тепер найцікавіше — "
-            "куди їдемо? 👇",
+            "Тепер найцікавіше 😎\n"
+            "🏁 Куди їдемо?",
             reply_markup=ReplyKeyboardRemove(),
         )
 
@@ -1481,56 +1934,10 @@ async def location_handler(
 
         await message.answer(
             "📍 Геолокацію отримав ✓\n\n"
-            "Поруч не бачу зупинки "
-            "в межах приблизно 1 км.\n\n"
+            "Поруч не знайшов зупинки.\n\n"
             "Все одно напиши, куди їдемо 👇",
             reply_markup=ReplyKeyboardRemove(),
         )
-
-
-# ==================================================
-# GPS DEBUG
-# ==================================================
-
-@dp.message(F.text == "/gpsdebug")
-async def gps_debug_handler(
-    message: Message
-):
-    vehicles = await get_live_vehicles()
-
-    route_counts = defaultdict(int)
-
-    for vehicle in vehicles:
-        route_counts[
-            vehicle[
-                "route_short_name"
-            ]
-        ] += 1
-
-    route_counts = sorted(
-        route_counts.items(),
-        key=lambda x: (
-            -x[1],
-            x[0],
-        ),
-    )
-
-    lines = [
-        "🛰 GPS DEBUG",
-        "",
-        f"🕙 {current_time().strftime('%H:%M:%S')}",
-        f"✅ Свіжих машин: {len(vehicles)}",
-        "",
-    ]
-
-    for number, count in route_counts[:30]:
-        lines.append(
-            f"№{number or '?'} — {count}"
-        )
-
-    await message.answer(
-        "\n".join(lines)
-    )
 
 
 # ==================================================
@@ -1553,6 +1960,64 @@ async def debug_handler(
 
 
 # ==================================================
+# WHERE IS TRANSPORT
+# ==================================================
+
+@dp.message(
+    F.text == "🛰 Де зараз транспорт?"
+)
+async def where_transport_handler(
+    message: Message
+):
+    user_id = message.from_user.id
+
+    user_data = users.get(user_id)
+
+    if not user_data:
+
+        await message.answer(
+            "Спочатку побудуй маршрут 👇",
+            reply_markup=start_keyboard,
+        )
+        return
+
+    if not user_data.get(
+        "selected_route"
+    ):
+
+        await message.answer(
+            "Спочатку потрібно знайти маршрут.\n\n"
+            "Натисни «🧭 Новий маршрут».",
+            reply_markup=route_keyboard,
+        )
+        return
+
+    status_message = await message.answer(
+        "🛰 Перевіряю, де зараз транспорт..."
+    )
+
+    refreshed = await refresh_saved_route(
+        user_data
+    )
+
+    if not refreshed:
+
+        await status_message.edit_text(
+            "Не вдалося оновити маршрут."
+        )
+        return
+
+    text = format_live_refresh(
+        refreshed["route"],
+        refreshed["updated_at"],
+    )
+
+    await status_message.edit_text(
+        text
+    )
+
+
+# ==================================================
 # TEXT
 # ==================================================
 
@@ -1563,9 +2028,7 @@ async def text_handler(
     user_id = message.from_user.id
     text = message.text.strip()
 
-    # ----------------------------------------------
-    # NEW ROUTE
-    # ----------------------------------------------
+    # ---------------- NEW ROUTE ----------------
 
     if text == "🧭 Новий маршрут":
 
@@ -1574,16 +2037,14 @@ async def text_handler(
         }
 
         await message.answer(
-            "🧭 Будуємо новий маршрут.\n\n"
+            "🧭 Новий маршрут\n\n"
             "Звідки вирушаємо? 👇",
             reply_markup=start_keyboard,
         )
 
         return
 
-    # ----------------------------------------------
-    # MANUAL ORIGIN
-    # ----------------------------------------------
+    # ---------------- MANUAL ADDRESS ----------------
 
     if text == "🔎 Ввести адресу":
 
@@ -1613,9 +2074,7 @@ async def text_handler(
         user_id
     ].get("step")
 
-    # ----------------------------------------------
-    # ORIGIN ADDRESS
-    # ----------------------------------------------
+    # ---------------- ORIGIN ADDRESS ----------------
 
     if step == "waiting_origin_address":
 
@@ -1671,14 +2130,12 @@ async def text_handler(
 
         return
 
-    # ----------------------------------------------
-    # DESTINATION
-    # ----------------------------------------------
+    # ---------------- DESTINATION ----------------
 
     if step == "waiting_destination":
 
-        await message.answer(
-            "🧭 Шукаю найкращий варіант...\n"
+        searching = await message.answer(
+            "🧭 Шукаю найкращий маршрут...\n"
             "🛰 Перевіряю транспорт наживо."
         )
 
@@ -1688,7 +2145,7 @@ async def text_handler(
 
         if not destination:
 
-            await message.answer(
+            await searching.edit_text(
                 "🤔 Не знайшов цю адресу.\n\n"
                 "Спробуй написати точніше, "
                 "наприклад: Височана 18."
@@ -1722,14 +2179,16 @@ async def text_handler(
                 user_id
             ]["step"] = "done"
 
-            await message.answer(
+            await searching.edit_text(
                 "🤔 Зручного прямого маршруту "
                 "поруч не знайшов.\n\n"
                 "Ймовірно, сюди краще їхати "
-                "з пересадкою.\n\n"
-                "🔄 Пошук із пересадками "
-                "додамо наступним етапом.",
-                reply_markup=new_route_keyboard,
+                "з пересадкою."
+            )
+
+            await message.answer(
+                "Що робимо далі? 👇",
+                reply_markup=route_keyboard,
             )
 
             return
@@ -1737,315 +2196,48 @@ async def text_handler(
         options = result["routes"]
         best = options[0]
 
-        route = best["route"]
-        live = best["live"]
+        # ------------------------------------------
+        # ЗБЕРІГАЄМО МАРШРУТ
+        # ------------------------------------------
 
-        lines = [
-            "⚡ НАЙКРАЩИЙ ВАРІАНТ",
-            "━━━━━━━━━━━━━━",
-            f"🏁 {text}",
-            "",
-            f"🚌 Маршрут №{route['number']}",
-        ]
+        users[user_id][
+            "selected_route"
+        ] = best
 
-        if route.get("headsign"):
+        users[user_id][
+            "destination_text"
+        ] = text
 
-            lines.append(
-                f"➡️ {route['headsign']}"
-            )
+        users[user_id][
+            "destination"
+        ] = destination
 
-        lines.extend(
-            [
-                "",
-                "🚶 ДО ЗУПИНКИ",
-                (
-                    f"«{best['origin']['name']}» — "
-                    f"{round(best['origin']['distance'])} м"
-                ),
-                (
-                    f"≈ {best['walk_to_minutes']} хв пішки"
-                ),
-                "",
-            ]
+        users[user_id][
+            "step"
+        ] = "route_ready"
+
+        formatted = format_route_result(
+            text,
+            options,
+            result["updated_at"],
         )
 
-        best_vehicle = live.get(
-            "best_vehicle"
-        )
-
-        # ------------------------------------------
-        # APPROACHING VEHICLE FOUND
-        # ------------------------------------------
-
-        if best_vehicle:
-
-            vehicle = best_vehicle[
-                "vehicle"
-            ]
-
-            stops_before = best_vehicle[
-                "stops_before"
-            ]
-
-            eta_low = best_vehicle[
-                "eta_low"
-            ]
-
-            eta_high = best_vehicle[
-                "eta_high"
-            ]
-
-            lines.extend(
-                [
-                    "🛰 ТРАНСПОРТ НАЖИВО",
-                    (
-                        f"🟢 Знайшов машину №"
-                        f"{vehicle['gov_number'] or '—'}, "
-                        "яка ймовірно рухається "
-                        "в потрібному напрямку."
-                    ),
-                    (
-                        f"📍 Зараз біля "
-                        f"«{best_vehicle['nearest_route_stop']['name']}»"
-                    ),
-                ]
-            )
-
-            if stops_before == 0:
-
-                lines.append(
-                    "🚏 Вона вже в районі "
-                    "твоєї посадкової зупинки."
-                )
-
-            else:
-
-                lines.append(
-                    f"🚏 До твоєї зупинки орієнтовно "
-                    f"{stops_before} "
-                    f"{plural_stops(stops_before)}"
-                )
-
-            lines.extend(
-                [
-                    (
-                        f"📏 По маршруту ≈ "
-                        f"{format_distance(best_vehicle['route_distance'])}"
-                    ),
-                    (
-                        f"⏱ Орієнтовне прибуття: "
-                        f"{eta_low}–{eta_high} хв"
-                    ),
-                    (
-                        f"🕒 GPS оновлено "
-                        f"{format_gps_age(vehicle['age'])}"
-                    ),
-                ]
-            )
-
-            # --------------------------------------
-            # WHEN TO LEAVE
-            # --------------------------------------
-
-            walk = best[
-                "walk_to_minutes"
-            ]
-
-            safe_eta = eta_low
-
-            leave_in = (
-                safe_eta
-                - walk
-                - 2
-            )
-
-            lines.append("")
-
-            if leave_in <= 0:
-
-                lines.append(
-                    "⚡ ВИХОДЬ ЗАРАЗ"
-                )
-
-                lines.append(
-                    "Щоб не ризикувати пропустити транспорт."
-                )
-
-            elif leave_in <= 3:
-
-                lines.append(
-                    "⚡ МОЖНА ВЖЕ ВИХОДИТИ"
-                )
-
-                lines.append(
-                    f"До зупинки тобі ≈ {walk} хв."
-                )
-
-            else:
-
-                lines.append(
-                    f"⚡ Можеш виходити приблизно "
-                    f"через {round(leave_in)} хв"
-                )
-
-                lines.append(
-                    f"До зупинки тобі ≈ {walk} хв."
-                )
-
-        # ------------------------------------------
-        # ROUTE HAS GPS BUT DIRECTION UNCERTAIN
-        # ------------------------------------------
-
-        elif live[
-            "route_vehicle_count"
-        ] > 0:
-
-            count = live[
-                "route_vehicle_count"
-            ]
-
-            lines.extend(
-                [
-                    "🛰 ТРАНСПОРТ НАЖИВО",
-                    (
-                        f"🟡 На маршруті №{route['number']} "
-                        f"бачу {count} GPS-маш."
-                    ),
-                    (
-                        "Але зараз не можу достатньо "
-                        "надійно підтвердити, що одна з них "
-                        "ще їде саме до твоєї зупинки."
-                    ),
-                ]
-            )
-
-        # ------------------------------------------
-        # NO GPS
-        # ------------------------------------------
-
-        else:
-
-            lines.extend(
-                [
-                    "🛰 ТРАНСПОРТ НАЖИВО",
-                    (
-                        f"⚪ Свіжої GPS-позиції "
-                        f"маршруту №{route['number']} "
-                        "зараз не бачу."
-                    ),
-                ]
-            )
-
-        # ------------------------------------------
-        # TRIP
-        # ------------------------------------------
-
-        lines.extend(
-            [
-                "",
-                "🚌 ПОЇЗДКА",
-                (
-                    f"Їхати приблизно "
-                    f"{best['stop_count']} "
-                    f"{plural_stops(best['stop_count'])}"
-                ),
-                "",
-                "🚏 ДЕ ВИХОДИТИ",
-                (
-                    f"«{best['destination']['name']}»"
-                ),
-                (
-                    f"🚶 Звідти до адреси "
-                    f"{round(best['destination']['distance'])} м "
-                    f"≈ {best['walk_after_minutes']} хв"
-                ),
-            ]
-        )
-
-        # ------------------------------------------
-        # ALTERNATIVES
-        # ------------------------------------------
-
-        alternatives = options[1:3]
-
-        if alternatives:
-
-            lines.extend(
-                [
-                    "",
-                    "━━━━━━━━━━━━━━",
-                    "🔄 ЩЕ ВАРІАНТИ",
-                ]
-            )
-
-            for alternative in alternatives:
-
-                alt_route = alternative[
-                    "route"
-                ]
-
-                alt_live = alternative[
-                    "live"
-                ]
-
-                alt_vehicle = alt_live.get(
-                    "best_vehicle"
-                )
-
-                if alt_vehicle:
-
-                    status = (
-                        f"🟢 ≈ "
-                        f"{alt_vehicle['eta_low']}–"
-                        f"{alt_vehicle['eta_high']} хв"
-                    )
-
-                elif (
-                    alt_live[
-                        "route_vehicle_count"
-                    ] > 0
-                ):
-
-                    status = (
-                        "🟡 GPS є, напрямок неясний"
-                    )
-
-                else:
-
-                    status = "⚪ GPS немає"
-
-                lines.append(
-                    f"• №{alt_route['number']} — "
-                    f"{round(alternative['origin']['distance'])} м "
-                    f"до посадки; "
-                    f"{round(alternative['destination']['distance'])} м "
-                    f"після виходу; {status}"
-                )
-
-        lines.extend(
-            [
-                "",
-                "━━━━━━━━━━━━━━",
-                "ℹ️ ETA поки орієнтовний: "
-                "враховує GPS, положення машини "
-                "відносно зупинок і міський рух.",
-            ]
+        await searching.edit_text(
+            formatted
         )
 
         await message.answer(
-            "\n".join(lines),
-            reply_markup=new_route_keyboard,
+            "🛰 Хочеш перевірити, "
+            "де транспорт зараз?\n"
+            "Натисни кнопку нижче 👇",
+            reply_markup=route_keyboard,
         )
-
-        users[
-            user_id
-        ]["step"] = "done"
 
         return
 
     await message.answer(
-        "🧭 Готовий побудувати новий маршрут.",
-        reply_markup=new_route_keyboard,
+        "Обери дію нижче 👇",
+        reply_markup=route_keyboard,
     )
 
 
@@ -2054,15 +2246,15 @@ async def text_handler(
 # ==================================================
 
 async def main():
-
     print(
-        "MENI-TUDY DIRECTION + ETA START",
+        "MENI-TUDY LIVE REFRESH START",
         flush=True,
     )
 
     loaded = await load_gtfs()
 
     if not loaded:
+
         print(
             "WARNING: GTFS NOT LOADED",
             flush=True,
