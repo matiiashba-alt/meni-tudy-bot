@@ -267,9 +267,7 @@ async def load_gtfs():
             archive.namelist()
         )
 
-        # ------------------------------------------
         # STOPS
-        # ------------------------------------------
 
         new_stops = {}
 
@@ -299,9 +297,7 @@ async def load_gtfs():
 
         stops = new_stops
 
-        # ------------------------------------------
         # ROUTES
-        # ------------------------------------------
 
         new_routes = {}
 
@@ -331,9 +327,7 @@ async def load_gtfs():
 
         routes = new_routes
 
-        # ------------------------------------------
         # TRIPS
-        # ------------------------------------------
 
         new_trips = {}
 
@@ -367,9 +361,7 @@ async def load_gtfs():
 
         trips = new_trips
 
-        # ------------------------------------------
         # CALENDAR
-        # ------------------------------------------
 
         new_calendar_services = {}
 
@@ -390,25 +382,11 @@ async def load_gtfs():
                     service_id
                 ] = row
 
-            print(
-                f"calendar.txt loaded: "
-                f"{len(new_calendar_services)} services",
-                flush=True,
-            )
-
-        else:
-            print(
-                "calendar.txt not found",
-                flush=True,
-            )
-
         calendar_services = (
             new_calendar_services
         )
 
-        # ------------------------------------------
         # CALENDAR DATES
-        # ------------------------------------------
 
         new_exceptions = defaultdict(dict)
 
@@ -441,25 +419,11 @@ async def load_gtfs():
                         service_id
                     ] = exception_type
 
-            print(
-                f"calendar_dates.txt loaded: "
-                f"{len(new_exceptions)} dates",
-                flush=True,
-            )
-
-        else:
-            print(
-                "calendar_dates.txt not found",
-                flush=True,
-            )
-
         calendar_exceptions = (
             new_exceptions
         )
 
-        # ------------------------------------------
         # STOP TIMES
-        # ------------------------------------------
 
         raw_sequences = defaultdict(list)
 
@@ -548,7 +512,9 @@ async def load_gtfs():
             f"GTFS READY: "
             f"{len(stops)} stops / "
             f"{len(routes)} routes / "
-            f"{len(trips)} trips",
+            f"{len(trips)} trips / "
+            f"{len(calendar_services)} calendar services / "
+            f"{len(calendar_exceptions)} exception dates",
             flush=True,
         )
 
@@ -560,7 +526,7 @@ async def load_gtfs():
 
 
 # ==================================================
-# АКТИВНИЙ SERVICE_ID
+# АКТИВНІ РЕЙСИ
 # ==================================================
 
 def service_is_active(
@@ -571,7 +537,6 @@ def service_is_active(
         "%Y%m%d"
     )
 
-    # Спочатку перевіряємо виняток
     exception = (
         calendar_exceptions
         .get(date_string, {})
@@ -584,7 +549,6 @@ def service_is_active(
     if exception == "2":
         return False
 
-    # Потім звичайний календар
     calendar = calendar_services.get(
         service_id
     )
@@ -613,7 +577,7 @@ def service_is_active(
         ):
             return False
 
-        weekday_names = [
+        weekdays = [
             "monday",
             "tuesday",
             "wednesday",
@@ -623,7 +587,7 @@ def service_is_active(
             "sunday",
         ]
 
-        weekday = weekday_names[
+        weekday = weekdays[
             date.weekday()
         ]
 
@@ -635,13 +599,9 @@ def service_is_active(
             == "1"
         )
 
-    # Якщо calendar.txt немає,
-    # але є calendar_dates.txt,
-    # активним є тільки явно доданий рейс.
     if calendar_exceptions:
         return False
 
-    # Fallback для GTFS без обох календарів
     return True
 
 
@@ -715,7 +675,7 @@ def route_info(trip_id):
 
 
 # ==================================================
-# ПОШУК РЕАЛЬНОГО НАЙБЛИЖЧОГО РЕЙСУ
+# ПОШУК НАЙБЛИЖЧОГО РЕЙСУ
 # ==================================================
 
 def find_best_current_routes(
@@ -735,7 +695,6 @@ def find_best_current_routes(
 
     for origin in origin_candidates:
 
-        # До посадки максимум 600 м
         if origin["distance"] > 600:
             continue
 
@@ -743,8 +702,7 @@ def find_best_current_routes(
             origin["distance"] / 80
         )
 
-        # Даємо 1 хв запасу
-        arrival_at_stop_seconds = (
+        arrival_at_stop = (
             current_seconds
             + walk_to_minutes * 60
             + 60
@@ -792,14 +750,11 @@ def find_best_current_routes(
             if departure is None:
                 continue
 
-            # Цей транспорт уже не встигнемо
-            if departure < arrival_at_stop_seconds:
+            if departure < arrival_at_stop:
                 continue
 
-            # Не показуємо рейси через багато годин
             if (
-                departure
-                - current_seconds
+                departure - current_seconds
                 > 2 * 3600
             ):
                 continue
@@ -825,7 +780,6 @@ def find_best_current_routes(
                     ]
                 )
 
-                # Після висадки максимум 600 м
                 if destination["distance"] > 600:
                     continue
 
@@ -885,7 +839,6 @@ def find_best_current_routes(
                     - origin_position
                 )
 
-                # Невеликий штраф за довгу ходьбу
                 walking_penalty = 0
 
                 if origin["distance"] > 400:
@@ -918,8 +871,6 @@ def find_best_current_routes(
 
                 break
 
-    # Один найкращий найближчий рейс
-    # для кожного маршруту
     best_by_route = {}
 
     for item in results:
@@ -952,11 +903,132 @@ def find_best_current_routes(
 
 
 # ==================================================
+# DEBUG
+# ==================================================
+
+@dp.message(F.text == "/debug")
+async def debug_handler(message: Message):
+
+    now, current_seconds = (
+        current_time_info()
+    )
+
+    today = now.date()
+
+    date_string = today.strftime(
+        "%Y%m%d"
+    )
+
+    all_service_ids = set()
+
+    for trip in trips.values():
+
+        service_id = trip.get(
+            "service_id"
+        )
+
+        if service_id:
+            all_service_ids.add(
+                service_id
+            )
+
+    active_service_ids = []
+
+    for service_id in all_service_ids:
+
+        if service_is_active(
+            service_id,
+            today,
+        ):
+            active_service_ids.append(
+                service_id
+            )
+
+    active_trip_count = 0
+
+    for trip in trips.values():
+
+        service_id = trip.get(
+            "service_id"
+        )
+
+        if (
+            service_id
+            and service_is_active(
+                service_id,
+                today,
+            )
+        ):
+            active_trip_count += 1
+
+    exception_today = (
+        calendar_exceptions.get(
+            date_string,
+            {}
+        )
+    )
+
+    sample_services = list(
+        all_service_ids
+    )[:10]
+
+    sample_active = (
+        active_service_ids[:10]
+    )
+
+    debug_text = (
+        "🔧 GTFS DEBUG\n\n"
+
+        f"🕙 Час бота: "
+        f"{now.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+
+        f"🚏 Зупинок: "
+        f"{len(stops)}\n"
+
+        f"🚌 Маршрутів: "
+        f"{len(routes)}\n"
+
+        f"🚍 Рейсів: "
+        f"{len(trips)}\n\n"
+
+        f"📅 service_id у trips.txt: "
+        f"{len(all_service_ids)}\n"
+
+        f"📅 service_id у calendar.txt: "
+        f"{len(calendar_services)}\n"
+
+        f"📅 Дат у calendar_dates.txt: "
+        f"{len(calendar_exceptions)}\n\n"
+
+        f"✅ Активних service_id сьогодні: "
+        f"{len(active_service_ids)}\n"
+
+        f"✅ Активних рейсів сьогодні: "
+        f"{active_trip_count}\n\n"
+
+        f"🗓 Винятків на "
+        f"{date_string}: "
+        f"{len(exception_today)}\n\n"
+
+        f"🔹 Приклад service_id:\n"
+        f"{sample_services}\n\n"
+
+        f"🔹 Активні service_id:\n"
+        f"{sample_active}"
+    )
+
+    await message.answer(
+        debug_text
+    )
+
+
+# ==================================================
 # START
 # ==================================================
 
 @dp.message(CommandStart())
 async def start_handler(message: Message):
+
     user_id = message.from_user.id
 
     users[user_id] = {
@@ -978,6 +1050,7 @@ async def start_handler(message: Message):
 
 @dp.message(F.location)
 async def location_handler(message: Message):
+
     user_id = message.from_user.id
 
     latitude = (
@@ -1028,6 +1101,7 @@ async def location_handler(message: Message):
 
 @dp.message(F.text)
 async def text_handler(message: Message):
+
     user_id = message.from_user.id
     text = message.text.strip()
 
@@ -1058,7 +1132,7 @@ async def text_handler(message: Message):
     ].get("step")
 
     # ------------------------------------------
-    # START ADDRESS
+    # АДРЕСА СТАРТУ
     # ------------------------------------------
 
     if step == "waiting_origin_address":
@@ -1089,15 +1163,32 @@ async def text_handler(message: Message):
             "origin_stops": origin_stops,
         }
 
+        if origin_stops:
+
+            nearest = origin_stops[0]
+
+            nearest_text = (
+                "\n\n🚏 Найближча зупинка:\n"
+                f"«{nearest['name']}» — "
+                f"{round(nearest['distance'])} м"
+            )
+
+        else:
+
+            nearest_text = (
+                "\n\n⚠️ Зупинок поруч не знайшов."
+            )
+
         await message.answer(
-            f"✅ Звідки: {text}\n\n"
-            "🏁 Тепер напиши, куди їдемо."
+            f"✅ Звідки: {text}"
+            + nearest_text
+            + "\n\n🏁 Тепер напиши, куди їдемо."
         )
 
         return
 
     # ------------------------------------------
-    # DESTINATION
+    # ПУНКТ ПРИЗНАЧЕННЯ
     # ------------------------------------------
 
     if step == "waiting_destination":
@@ -1210,6 +1301,10 @@ async def text_handler(message: Message):
                     f"🚶 Ще "
                     f"{round(best['destination']['distance'])} м"
                 ),
+                (
+                    f"   ≈ "
+                    f"{format_minutes(best['walk_from_minutes'])}"
+                ),
                 "",
                 (
                     f"🏁 Прибуття приблизно: "
@@ -1263,14 +1358,14 @@ async def text_handler(message: Message):
 async def main():
 
     print(
-        "MENI-TUDY LIVE SCHEDULE STARTING...",
+        "MENI-TUDY DEBUG VERSION STARTING...",
         flush=True,
     )
 
     await load_gtfs()
 
     print(
-        "MENI-TUDY LIVE SCHEDULE ONLINE",
+        "MENI-TUDY DEBUG VERSION ONLINE",
         flush=True,
     )
 
