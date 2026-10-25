@@ -38,13 +38,15 @@ bot = Bot(token=TOKEN)
 
 dp = Dispatcher()
 
+# Тимчасове зберігання даних користувачів
+
 users = {}
 
 # Офіційний GTFS Івано-Франківська
 
-GTFS_URL = "https://smartcity.mvk.if.ua/transport/gtfs/static.zip"
+GTFS_URL = "https://city.dozor.tech/iv-frankivsk/gtfs/static.zip"
 
-# Зупинки з GTFS зберігатимемо тут
+# Сюди завантажаться всі зупинки
 
 gtfs_stops = []
 
@@ -82,7 +84,7 @@ location_keyboard = ReplyKeyboardMarkup(
 
 # --------------------------------------------------
 
-# ВІДСТАНЬ МІЖ ДВОМА КООРДИНАТАМИ
+# ВІДСТАНЬ МІЖ ДВОМА ТОЧКАМИ
 
 # --------------------------------------------------
 
@@ -170,6 +172,14 @@ async def geocode_address(address):
 
                 if response.status != 200:
 
+                    print(
+
+                        f"Geocoding HTTP error: {response.status}",
+
+                        flush=True,
+
+                    )
+
                     return None
 
                 data = await response.json()
@@ -226,13 +236,13 @@ async def load_gtfs():
 
     )
 
-    timeout = aiohttp.ClientTimeout(total=30)
-
     headers = {
 
         "User-Agent": "MeniTudyTelegramBot/1.0"
 
     }
+
+    timeout = aiohttp.ClientTimeout(total=30)
 
     try:
 
@@ -250,11 +260,19 @@ async def load_gtfs():
 
             ) as response:
 
+                print(
+
+                    f"GTFS HTTP status: {response.status}",
+
+                    flush=True,
+
+                )
+
                 if response.status != 200:
 
                     print(
 
-                        f"GTFS HTTP error: {response.status}",
+                        "GTFS download failed",
 
                         flush=True,
 
@@ -264,9 +282,25 @@ async def load_gtfs():
 
                 content = await response.read()
 
+        print(
+
+            f"GTFS downloaded: {len(content)} bytes",
+
+            flush=True,
+
+        )
+
         archive = zipfile.ZipFile(
 
             io.BytesIO(content)
+
+        )
+
+        print(
+
+            f"GTFS files: {archive.namelist()}",
+
+            flush=True,
 
         )
 
@@ -300,9 +334,17 @@ async def load_gtfs():
 
                 try:
 
-                    lat = float(row["stop_lat"])
+                    latitude = float(
 
-                    lon = float(row["stop_lon"])
+                        row["stop_lat"]
+
+                    )
+
+                    longitude = float(
+
+                        row["stop_lon"]
+
+                    )
 
                     stops.append(
 
@@ -324,9 +366,9 @@ async def load_gtfs():
 
                             ),
 
-                            "latitude": lat,
+                            "latitude": latitude,
 
-                            "longitude": lon,
+                            "longitude": longitude,
 
                         }
 
@@ -354,6 +396,16 @@ async def load_gtfs():
 
         )
 
+    except zipfile.BadZipFile:
+
+        print(
+
+            "GTFS error: downloaded file is not ZIP",
+
+            flush=True,
+
+        )
+
     except Exception as error:
 
         print(
@@ -366,7 +418,7 @@ async def load_gtfs():
 
 # --------------------------------------------------
 
-# НАЙБЛИЖЧА ЗУПИНКА
+# ПОШУК НАЙБЛИЖЧОЇ ЗУПИНКИ
 
 # --------------------------------------------------
 
@@ -376,7 +428,7 @@ def find_nearest_stop(latitude, longitude):
 
         return None
 
-    nearest = None
+    nearest_stop = None
 
     nearest_distance = None
 
@@ -402,15 +454,15 @@ def find_nearest_stop(latitude, longitude):
 
         ):
 
-            nearest = stop
+            nearest_stop = stop
 
             nearest_distance = distance
 
-    if nearest is None:
+    if nearest_stop is None:
 
         return None
 
-    result = nearest.copy()
+    result = nearest_stop.copy()
 
     result["distance"] = nearest_distance
 
@@ -454,7 +506,7 @@ async def start_handler(message: Message):
 
 # --------------------------------------------------
 
-# ГЕОЛОКАЦІЯ СТАРТУ
+# ОТРИМАННЯ ГЕОЛОКАЦІЇ
 
 # --------------------------------------------------
 
@@ -496,11 +548,11 @@ async def location_handler(message: Message):
 
             "\n\n🚏 Найближча зупинка:\n"
 
-            f"{nearest_stop['name']} — "
+            f"«{nearest_stop['name']}»\n"
 
-            f"приблизно "
+            f"🚶 Приблизно "
 
-            f"{round(nearest_stop['distance'])} м"
+            f"{round(nearest_stop['distance'])} м від тебе."
 
         )
 
@@ -554,9 +606,7 @@ async def text_handler(message: Message):
 
         await message.answer(
 
-            "📍 Напиши адресу, "
-
-            "звідки ти їдеш.\n\n"
+            "📍 Напиши адресу, звідки ти їдеш.\n\n"
 
             "Наприклад: Київська 1",
 
@@ -580,11 +630,11 @@ async def text_handler(message: Message):
 
     step = users[user_id].get("step")
 
-    # ----------------------------------------------
+    # --------------------------------------------------
 
-    # АДРЕСА СТАРТУ
+    # СТАРТОВА АДРЕСА
 
-    # ----------------------------------------------
+    # --------------------------------------------------
 
     if step == "waiting_origin_address":
 
@@ -638,17 +688,23 @@ async def text_handler(message: Message):
 
                 "\n\n🚏 Найближча зупинка:\n"
 
-                f"{nearest_stop['name']} — "
+                f"«{nearest_stop['name']}»\n"
 
-                f"приблизно "
+                f"🚶 Приблизно "
 
-                f"{round(nearest_stop['distance'])} м"
+                f"{round(nearest_stop['distance'])} м."
 
             )
 
         else:
 
-            stop_text = ""
+            stop_text = (
+
+                "\n\n⚠️ Дані зупинок поки "
+
+                "не завантажилися."
+
+            )
 
         await message.answer(
 
@@ -664,11 +720,11 @@ async def text_handler(message: Message):
 
         return
 
-    # ----------------------------------------------
+    # --------------------------------------------------
 
     # АДРЕСА ПРИЗНАЧЕННЯ
 
-    # ----------------------------------------------
+    # --------------------------------------------------
 
     if step == "waiting_destination":
 
@@ -744,13 +800,11 @@ async def text_handler(message: Message):
 
             origin_stop_text = (
 
-                f"🚏 Зупинка старту: "
+                "🚏 Найближча зупинка до тебе:\n"
 
-                f"{origin_stop['name']}\n"
+                f"«{origin_stop['name']}»\n"
 
-                f"🚶 Приблизно "
-
-                f"{round(origin_stop['distance'])} м"
+                f"🚶 {round(origin_stop['distance'])} м"
 
             )
 
@@ -758,7 +812,7 @@ async def text_handler(message: Message):
 
             origin_stop_text = (
 
-                "🚏 Зупинку старту "
+                "⚠️ Зупинку біля точки старту "
 
                 "не вдалося визначити."
 
@@ -768,13 +822,11 @@ async def text_handler(message: Message):
 
             destination_stop_text = (
 
-                f"🚏 Зупинка біля пункту призначення: "
+                "🚏 Зупинка біля пункту призначення:\n"
 
-                f"{destination_stop['name']}\n"
+                f"«{destination_stop['name']}»\n"
 
-                f"🚶 Приблизно "
-
-                f"{round(destination_stop['distance'])} м"
+                f"🚶 {round(destination_stop['distance'])} м"
 
             )
 
@@ -782,7 +834,7 @@ async def text_handler(message: Message):
 
             destination_stop_text = (
 
-                "🚏 Зупинку біля пункту призначення "
+                "⚠️ Зупинку біля пункту призначення "
 
                 "не вдалося визначити."
 
@@ -822,7 +874,7 @@ async def text_handler(message: Message):
 
 # --------------------------------------------------
 
-# ЗАПУСК
+# ЗАПУСК БОТА
 
 # --------------------------------------------------
 
