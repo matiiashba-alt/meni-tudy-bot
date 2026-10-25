@@ -4,7 +4,9 @@ import io
 import json
 import math
 import os
+import socket
 import zipfile
+from urllib.parse import urlparse
 from collections import defaultdict
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -37,6 +39,7 @@ dp = Dispatcher()
 ADMIN_ID = 1962638884
 DATABASE_URL = os.getenv("DATABASE_URL")
 db_pool = None
+db_last_error = None
 admin_broadcast_drafts = {}
 
 GTFS_URL = "https://city.dozor.tech/iv-frankivsk/gtfs/static.zip"
@@ -147,7 +150,7 @@ def is_admin(user_id):
 
 
 async def init_database():
-    global db_pool
+    global db_pool, db_last_error
     if not DATABASE_URL:
         print("WARNING: DATABASE_URL NOT SET", flush=True)
         return False
@@ -162,11 +165,13 @@ async def init_database():
         )
         async with db_pool.acquire() as conn:
             await conn.execute("SELECT 1")
+        db_last_error = None
         print("DATABASE CONNECTED", flush=True)
         return True
     except Exception as exc:
         db_pool = None
-        print(f"DATABASE ERROR: {exc}", flush=True)
+        db_last_error = f"{type(exc).__name__}: {exc}"
+        print(f"DATABASE ERROR: {db_last_error}", flush=True)
         return False
 
 
@@ -2099,10 +2104,97 @@ def format_live_refresh(
 # ADMIN
 # ==================================================
 
+async def get_database_diagnostics():
+    if not DATABASE_URL:
+        return {
+            "env": "❌ відсутній",
+            "host": "—",
+            "port": "—",
+            "dns": "❌ не перевірявся",
+            "connection": "❌ неможливо перевірити",
+            "error": "DATABASE_URL не заданий",
+        }
+
+    try:
+        parsed = urlparse(DATABASE_URL)
+        host = parsed.hostname or "невідомий"
+        port = parsed.port or 5432
+    except Exception as exc:
+        return {
+            "env": "✅ отримано",
+            "host": "не вдалося прочитати",
+            "port": "—",
+            "dns": "❌ не перевірявся",
+            "connection": "❌ помилка URL",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+    dns_status = "❌ помилка"
+    dns_error = None
+    try:
+        loop = asyncio.get_running_loop()
+        infos = await asyncio.wait_for(
+            loop.getaddrinfo(host, port, type=socket.SOCK_STREAM),
+            timeout=8,
+        )
+        families = {item[0] for item in infos}
+        family_names = []
+        if socket.AF_INET in families:
+            family_names.append("IPv4")
+        if socket.AF_INET6 in families:
+            family_names.append("IPv6")
+        dns_status = "✅ " + (" + ".join(family_names) or "адресу знайдено")
+    except Exception as exc:
+        dns_error = f"{type(exc).__name__}: {exc}"
+
+    connection_status = "❌ не підключено"
+    connection_error = None
+    test_conn = None
+    try:
+        test_conn = await asyncio.wait_for(
+            asyncpg.connect(
+                DATABASE_URL,
+                command_timeout=10,
+                statement_cache_size=0,
+                ssl="require",
+            ),
+            timeout=15,
+        )
+        await test_conn.execute("SELECT 1")
+        connection_status = "✅ PostgreSQL доступний"
+    except Exception as exc:
+        connection_error = f"{type(exc).__name__}: {exc}"
+    finally:
+        if test_conn is not None:
+            try:
+                await test_conn.close()
+            except Exception:
+                pass
+
+    error = connection_error or dns_error or db_last_error or "немає"
+    # Не дозволяємо випадково вивести пароль, навіть якщо драйвер включить URL у текст помилки.
+    if DATABASE_URL and DATABASE_URL in error:
+        error = error.replace(DATABASE_URL, "[DATABASE_URL приховано]")
+    if len(error) > 500:
+        error = error[:500] + "…"
+
+    return {
+        "env": "✅ отримано",
+        "host": host,
+        "port": str(port),
+        "dns": dns_status,
+        "connection": connection_status,
+        "error": error,
+    }
+
+
 async def send_admin_debug(
     message: Message
 ):
-    vehicles = await get_live_vehicles()
+    vehicles, db_diag = await asyncio.gather(
+        get_live_vehicles(),
+        get_database_diagnostics(),
+    )
 
     active_route_numbers = {
         vehicle["route_short_name"]
@@ -2121,8 +2213,14 @@ async def send_admin_debug(
         "🛰 REALTIME\n"
         f"🚍 Свіжих GPS-машин: {len(vehicles)}\n"
         f"🚌 Маршрутів із GPS: {len(active_route_numbers)}\n"
-        f"⏱ Ліміт свіжості GPS: "
-        f"{MAX_GPS_AGE_SECONDS // 60} хв\n\n"
+        f"⏱ Ліміт свіжості GPS: {MAX_GPS_AGE_SECONDS // 60} хв\n\n"
+        "🗄 БАЗА ДАНИХ\n"
+        f"DATABASE_URL: {db_diag['env']}\n"
+        f"Host: {db_diag['host']}\n"
+        f"Port: {db_diag['port']}\n"
+        f"DNS: {db_diag['dns']}\n"
+        f"PostgreSQL: {db_diag['connection']}\n"
+        f"Помилка: {db_diag['error']}\n\n"
         "👤 ПОТОЧНА СЕСІЯ\n"
         f"Користувачів у пам'яті: {len(users)}\n\n"
         f"🕒 Перевірено: {now().strftime('%d.%m.%Y %H:%M:%S')}",
