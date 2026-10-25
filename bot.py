@@ -1,6 +1,7 @@
 import asyncio
 import csv
 import io
+import json
 import math
 import os
 import zipfile
@@ -18,6 +19,10 @@ from aiogram.types import (
     ReplyKeyboardRemove,
 )
 
+# ==================================================
+# НАЛАШТУВАННЯ
+# ==================================================
+
 TOKEN = os.getenv("BOT_TOKEN")
 
 if not TOKEN:
@@ -27,6 +32,18 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
 GTFS_URL = "https://city.dozor.tech/iv-frankivsk/gtfs/static.zip"
+
+GPS_URLS = [
+    (
+        "vehicle_position",
+        "https://city.dozor.tech/iv-frankivsk/gtfs/vehicle_position",
+    ),
+    (
+        "devices.json",
+        "https://city.dozor.tech/ua/iv-frankivsk/devices.json",
+    ),
+]
+
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
 users = {}
@@ -42,17 +59,21 @@ calendar_services = {}
 calendar_exceptions = defaultdict(dict)
 
 
+# ==================================================
+# КЛАВІАТУРА
+# ==================================================
+
 location_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [
             KeyboardButton(
-                text="📍 Надіслати мою геолокацію",
+                text="📍 Я тут",
                 request_location=True,
             )
         ],
         [
             KeyboardButton(
-                text="✏️ Ввести адресу вручну"
+                text="🔎 Ввести адресу",
             )
         ],
     ],
@@ -249,13 +270,20 @@ async def load_gtfs():
             ) as response:
 
                 if response.status != 200:
+
                     print(
                         f"GTFS HTTP ERROR {response.status}",
                         flush=True,
                     )
+
                     return False
 
                 content = await response.read()
+
+        print(
+            f"GTFS ZIP: {len(content)} bytes",
+            flush=True,
+        )
 
         archive = zipfile.ZipFile(
             io.BytesIO(content)
@@ -265,7 +293,9 @@ async def load_gtfs():
             archive.namelist()
         )
 
+        # ------------------------------------------
         # STOPS
+        # ------------------------------------------
 
         new_stops = {}
 
@@ -273,6 +303,7 @@ async def load_gtfs():
             archive,
             "stops.txt",
         ):
+
             try:
                 stop_id = row["stop_id"]
 
@@ -290,7 +321,14 @@ async def load_gtfs():
 
         stops = new_stops
 
+        print(
+            f"STOPS: {len(stops)}",
+            flush=True,
+        )
+
+        # ------------------------------------------
         # ROUTES
+        # ------------------------------------------
 
         new_routes = {}
 
@@ -298,6 +336,7 @@ async def load_gtfs():
             archive,
             "routes.txt",
         ):
+
             route_id = row.get(
                 "route_id"
             )
@@ -318,7 +357,14 @@ async def load_gtfs():
 
         routes = new_routes
 
+        print(
+            f"ROUTES: {len(routes)}",
+            flush=True,
+        )
+
+        # ------------------------------------------
         # TRIPS
+        # ------------------------------------------
 
         new_trips = {}
 
@@ -326,6 +372,7 @@ async def load_gtfs():
             archive,
             "trips.txt",
         ):
+
             trip_id = row.get(
                 "trip_id"
             )
@@ -350,7 +397,14 @@ async def load_gtfs():
 
         trips = new_trips
 
+        print(
+            f"TRIPS: {len(trips)}",
+            flush=True,
+        )
+
+        # ------------------------------------------
         # CALENDAR
+        # ------------------------------------------
 
         new_calendar = {}
 
@@ -360,18 +414,22 @@ async def load_gtfs():
                 archive,
                 "calendar.txt",
             ):
+
                 service_id = row.get(
                     "service_id"
                 )
 
                 if service_id:
+
                     new_calendar[
                         service_id
                     ] = row
 
         calendar_services = new_calendar
 
+        # ------------------------------------------
         # CALENDAR DATES
+        # ------------------------------------------
 
         new_exceptions = defaultdict(dict)
 
@@ -381,6 +439,7 @@ async def load_gtfs():
                 archive,
                 "calendar_dates.txt",
             ):
+
                 service_id = row.get(
                     "service_id"
                 )
@@ -398,15 +457,26 @@ async def load_gtfs():
                     and date
                     and exception_type
                 ):
+
                     new_exceptions[
                         date
                     ][service_id] = exception_type
 
         calendar_exceptions = new_exceptions
 
+        # ------------------------------------------
         # STOP TIMES
+        # Потокове читання для економії RAM
+        # ------------------------------------------
 
         new_sequences = defaultdict(list)
+
+        print(
+            "READING STOP_TIMES...",
+            flush=True,
+        )
+
+        row_count = 0
 
         with archive.open(
             "stop_times.txt"
@@ -465,6 +535,17 @@ async def load_gtfs():
                         departure,
                     )
                 )
+
+                row_count += 1
+
+        print(
+            f"STOP_TIMES: {row_count}",
+            flush=True,
+        )
+
+        # ------------------------------------------
+        # ІНДЕКС ЗУПИНОК
+        # ------------------------------------------
 
         new_stop_to_trips = defaultdict(
             list
@@ -613,7 +694,9 @@ def nearby_stops(
         stop_data,
     ) in stops.items():
 
-        name, stop_lat, stop_lon = stop_data
+        name, stop_lat, stop_lon = (
+            stop_data
+        )
 
         distance = distance_meters(
             latitude,
@@ -902,11 +985,371 @@ def find_best_current_routes(
 
 
 # ==================================================
-# DEBUG
+# GPS DEBUG
+# ==================================================
+
+@dp.message(F.text == "/gpsdebug")
+async def gps_debug_handler(message: Message):
+
+    await message.answer(
+        "🛰 Перевіряю живі GPS-дані транспорту...\n"
+        "Зачекай кілька секунд."
+    )
+
+    lines = [
+        "🛰 GPS DEBUG",
+        "",
+    ]
+
+    headers = {
+        "User-Agent": "MeniTudyTelegramBot/1.0",
+        "Accept": "*/*",
+    }
+
+    timeout = aiohttp.ClientTimeout(
+        total=20
+    )
+
+    try:
+
+        async with aiohttp.ClientSession(
+            headers=headers,
+            timeout=timeout,
+        ) as session:
+
+            for name, url in GPS_URLS:
+
+                lines.append(
+                    f"━━ {name} ━━"
+                )
+
+                try:
+
+                    async with session.get(
+                        url
+                    ) as response:
+
+                        raw = await response.read()
+
+                        content_type = (
+                            response.headers.get(
+                                "Content-Type",
+                                "невідомо",
+                            )
+                        )
+
+                        lines.append(
+                            f"HTTP: {response.status}"
+                        )
+
+                        lines.append(
+                            f"Content-Type: {content_type}"
+                        )
+
+                        lines.append(
+                            f"Розмір: {len(raw)} байт"
+                        )
+
+                        if response.status != 200:
+
+                            lines.append(
+                                "❌ Сервер не повернув HTTP 200"
+                            )
+
+                            lines.append("")
+
+                            continue
+
+                        # --------------------------
+                        # ПРОБУЄМО UTF-8 + JSON
+                        # --------------------------
+
+                        try:
+
+                            decoded = raw.decode(
+                                "utf-8-sig"
+                            )
+
+                            data = json.loads(
+                                decoded
+                            )
+
+                            lines.append(
+                                "Формат: ✅ JSON"
+                            )
+
+                            # ----------------------
+                            # JSON LIST
+                            # ----------------------
+
+                            if isinstance(
+                                data,
+                                list,
+                            ):
+
+                                lines.append(
+                                    f"Об'єктів: {len(data)}"
+                                )
+
+                                if data:
+
+                                    first = data[0]
+
+                                    lines.append(
+                                        f"Тип першого: "
+                                        f"{type(first).__name__}"
+                                    )
+
+                                    if isinstance(
+                                        first,
+                                        dict,
+                                    ):
+
+                                        keys = list(
+                                            first.keys()
+                                        )
+
+                                        lines.append(
+                                            "Поля:"
+                                        )
+
+                                        lines.append(
+                                            ", ".join(
+                                                keys[:25]
+                                            )
+                                        )
+
+                                        preview = {}
+
+                                        for key in keys[:15]:
+
+                                            value = first.get(
+                                                key
+                                            )
+
+                                            if isinstance(
+                                                value,
+                                                (
+                                                    str,
+                                                    int,
+                                                    float,
+                                                    bool,
+                                                    type(None),
+                                                ),
+                                            ):
+
+                                                preview[
+                                                    key
+                                                ] = value
+
+                                        lines.append(
+                                            "Перший об'єкт:"
+                                        )
+
+                                        lines.append(
+                                            str(
+                                                preview
+                                            )[:1200]
+                                        )
+
+                            # ----------------------
+                            # JSON DICT
+                            # ----------------------
+
+                            elif isinstance(
+                                data,
+                                dict,
+                            ):
+
+                                keys = list(
+                                    data.keys()
+                                )
+
+                                lines.append(
+                                    "Тип: JSON object"
+                                )
+
+                                lines.append(
+                                    "Верхні поля:"
+                                )
+
+                                lines.append(
+                                    ", ".join(
+                                        keys[:25]
+                                    )
+                                )
+
+                                found_child = False
+
+                                for key in keys[:20]:
+
+                                    value = data.get(
+                                        key
+                                    )
+
+                                    if isinstance(
+                                        value,
+                                        list,
+                                    ):
+
+                                        found_child = True
+
+                                        lines.append(
+                                            f"{key}: "
+                                            f"{len(value)} об'єктів"
+                                        )
+
+                                        if (
+                                            value
+                                            and isinstance(
+                                                value[0],
+                                                dict,
+                                            )
+                                        ):
+
+                                            child_keys = list(
+                                                value[0].keys()
+                                            )
+
+                                            lines.append(
+                                                "Поля першого:"
+                                            )
+
+                                            lines.append(
+                                                ", ".join(
+                                                    child_keys[:25]
+                                                )
+                                            )
+
+                                            preview = {}
+
+                                            for child_key in child_keys[:15]:
+
+                                                child_value = (
+                                                    value[0].get(
+                                                        child_key
+                                                    )
+                                                )
+
+                                                if isinstance(
+                                                    child_value,
+                                                    (
+                                                        str,
+                                                        int,
+                                                        float,
+                                                        bool,
+                                                        type(None),
+                                                    ),
+                                                ):
+
+                                                    preview[
+                                                        child_key
+                                                    ] = child_value
+
+                                            lines.append(
+                                                "Приклад:"
+                                            )
+
+                                            lines.append(
+                                                str(
+                                                    preview
+                                                )[:1200]
+                                            )
+
+                                        break
+
+                                if not found_child:
+
+                                    preview = {}
+
+                                    for key in keys[:15]:
+
+                                        value = data.get(
+                                            key
+                                        )
+
+                                        if isinstance(
+                                            value,
+                                            (
+                                                str,
+                                                int,
+                                                float,
+                                                bool,
+                                                type(None),
+                                            ),
+                                        ):
+
+                                            preview[
+                                                key
+                                            ] = value
+
+                                    if preview:
+
+                                        lines.append(
+                                            "Приклад:"
+                                        )
+
+                                        lines.append(
+                                            str(
+                                                preview
+                                            )[:1200]
+                                        )
+
+                        except Exception as json_error:
+
+                            lines.append(
+                                "Формат: ❓ не JSON"
+                            )
+
+                            lines.append(
+                                f"JSON error: "
+                                f"{type(json_error).__name__}"
+                            )
+
+                            lines.append(
+                                "Перші 32 байти (HEX):"
+                            )
+
+                            lines.append(
+                                raw[:32].hex()
+                            )
+
+                except Exception as error:
+
+                    lines.append(
+                        f"❌ Помилка запиту: "
+                        f"{type(error).__name__}: {error}"
+                    )
+
+                lines.append("")
+
+    except Exception as error:
+
+        lines.append(
+            f"❌ Загальна помилка: "
+            f"{type(error).__name__}: {error}"
+        )
+
+    result = "\n".join(
+        lines
+    )
+
+    # Telegram має ліміт повідомлення.
+    if len(result) > 3900:
+        result = result[:3900] + "\n\n…обрізано"
+
+    await message.answer(
+        result
+    )
+
+
+# ==================================================
+# GTFS DEBUG
 # ==================================================
 
 @dp.message(F.text == "/debug")
 async def debug_handler(message: Message):
+
     now, _ = current_time_info()
 
     service_ids = {
@@ -960,6 +1403,7 @@ async def debug_handler(message: Message):
 
 @dp.message(F.text == "/debugroute")
 async def debug_route_handler(message: Message):
+
     user_id = message.from_user.id
 
     user = users.get(
@@ -998,7 +1442,6 @@ async def debug_route_handler(message: Message):
         "",
     ]
 
-    # Для діагностики беремо 5 найближчих зупинок.
     for origin in origin_stops[:5]:
 
         lines.append(
@@ -1043,7 +1486,9 @@ async def debug_route_handler(message: Message):
             ):
                 continue
 
-            item = sequence[position]
+            item = sequence[
+                position
+            ]
 
             departure = (
                 item[3]
@@ -1061,13 +1506,12 @@ async def debug_route_handler(message: Message):
             if not route:
                 continue
 
-            # Показуємо від 3 годин тому
-            # до 4 годин вперед.
             if (
                 current_seconds - 10800
                 <= departure
                 <= current_seconds + 14400
             ):
+
                 departures.append(
                     (
                         departure,
@@ -1079,9 +1523,7 @@ async def debug_route_handler(message: Message):
             key=lambda x: x[0]
         )
 
-        # Прибираємо точні дублікати.
         unique = []
-
         seen = set()
 
         for departure, number in departures:
@@ -1111,8 +1553,6 @@ async def debug_route_handler(message: Message):
 
         else:
 
-            # Максимум 12 записів на зупинку,
-            # щоб Telegram-повідомлення не було величезним.
             for (
                 departure,
                 number,
@@ -1149,6 +1589,7 @@ async def debug_route_handler(message: Message):
 
 @dp.message(CommandStart())
 async def start_handler(message: Message):
+
     users[
         message.from_user.id
     ] = {
@@ -1156,8 +1597,16 @@ async def start_handler(message: Message):
     }
 
     await message.answer(
-        "👋 Привіт! Я — «Мені туди».\n\n"
-        "📍 Звідки ти їдеш?",
+        "🚌 МЕНІ ТУДИ\n"
+        "Івано-Франківськ\n\n"
+        "Куди б ти не збирався — "
+        "спробую знайти найзручніший шлях "
+        "громадським транспортом ⚡\n\n"
+        "📍 знайду найближчу зупинку\n"
+        "🚌 підберу потрібний маршрут\n"
+        "🚏 підкажу, де виходити\n"
+        "🛰 готуємо підключення транспорту наживо\n\n"
+        "Спочатку визначимо точку старту 👇",
         reply_markup=location_keyboard,
     )
 
@@ -1168,6 +1617,7 @@ async def start_handler(message: Message):
 
 @dp.message(F.location)
 async def location_handler(message: Message):
+
     user_id = message.from_user.id
 
     latitude = (
@@ -1194,24 +1644,24 @@ async def location_handler(message: Message):
 
         nearest = origin_stops[0]
 
-        info = (
-            "\n\n🚏 Найближча зупинка:\n"
-            f"«{nearest['name']}» — "
-            f"{round(nearest['distance'])} м"
+        await message.answer(
+            "📍 Точку старту знайшов ✓\n\n"
+            f"Найближча зупинка:\n"
+            f"🚏 «{nearest['name']}»\n"
+            f"🚶 приблизно {round(nearest['distance'])} м від тебе\n\n"
+            "Тепер найцікавіше 😎\n"
+            "🏁 Куди тобі потрібно?",
+            reply_markup=ReplyKeyboardRemove(),
         )
 
     else:
 
-        info = (
-            "\n\n⚠️ Зупинок поруч не знайшов."
+        await message.answer(
+            "📍 Геолокацію отримав, але поруч "
+            "не знайшов зупинки в базі.\n\n"
+            "🏁 Все одно напиши, куди тобі потрібно.",
+            reply_markup=ReplyKeyboardRemove(),
         )
-
-    await message.answer(
-        "✅ Геолокацію отримано!"
-        + info
-        + "\n\n🏁 Куди тобі потрібно їхати?",
-        reply_markup=ReplyKeyboardRemove(),
-    )
 
 
 # ==================================================
@@ -1220,17 +1670,20 @@ async def location_handler(message: Message):
 
 @dp.message(F.text)
 async def text_handler(message: Message):
+
     user_id = message.from_user.id
     text = message.text.strip()
 
-    if text == "✏️ Ввести адресу вручну":
+    if text == "🔎 Ввести адресу":
 
         users[user_id] = {
             "step": "waiting_origin_address"
         }
 
         await message.answer(
-            "📍 Напиши адресу, звідки ти їдеш.",
+            "🔎 Добре. Напиши адресу, "
+            "звідки ти вирушаєш.\n\n"
+            "Наприклад: Південний бульвар 35",
             reply_markup=ReplyKeyboardRemove(),
         )
 
@@ -1239,7 +1692,7 @@ async def text_handler(message: Message):
     if user_id not in users:
 
         await message.answer(
-            "Натисни /start."
+            "Натисни /start — і почнемо 🚀"
         )
 
         return
@@ -1248,12 +1701,14 @@ async def text_handler(message: Message):
         user_id
     ].get("step")
 
+    # ----------------------------------------------
     # АДРЕСА СТАРТУ
+    # ----------------------------------------------
 
     if step == "waiting_origin_address":
 
         await message.answer(
-            "🔎 Шукаю адресу..."
+            "🔎 Шукаю цю адресу..."
         )
 
         result = await geocode_address(
@@ -1263,7 +1718,8 @@ async def text_handler(message: Message):
         if not result:
 
             await message.answer(
-                "❌ Не знайшов адресу."
+                "❌ Не зміг знайти цю адресу.\n\n"
+                "Спробуй написати вулицю та номер будинку."
             )
 
             return
@@ -1280,19 +1736,36 @@ async def text_handler(message: Message):
             "longitude": result["longitude"],
         }
 
-        await message.answer(
-            f"✅ Звідки: {text}\n\n"
-            "🏁 Тепер напиши, куди їдемо."
-        )
+        if origin_stops:
+
+            nearest = origin_stops[0]
+
+            await message.answer(
+                "📍 Точку старту знайшов ✓\n\n"
+                f"🚏 Найближча зупинка: "
+                f"«{nearest['name']}»\n"
+                f"🚶 {round(nearest['distance'])} м\n\n"
+                "🏁 А тепер напиши, куди їдемо."
+            )
+
+        else:
+
+            await message.answer(
+                "📍 Адресу знайшов ✓\n\n"
+                "🏁 Тепер напиши, куди їдемо."
+            )
 
         return
 
-    # ПУНКТ ПРИЗНАЧЕННЯ
+    # ----------------------------------------------
+    # ПРИЗНАЧЕННЯ
+    # ----------------------------------------------
 
     if step == "waiting_destination":
 
         await message.answer(
-            "🔎 Перевіряю рейси та рахую час..."
+            "🧭 Шукаю найкращий шлях...\n"
+            "Перевіряю зупинки та маршрути."
         )
 
         destination = await geocode_address(
@@ -1302,7 +1775,8 @@ async def text_handler(message: Message):
         if not destination:
 
             await message.answer(
-                "❌ Не знайшов адресу призначення."
+                "❌ Не зміг знайти пункт призначення.\n\n"
+                "Спробуй написати адресу трохи точніше."
             )
 
             return
@@ -1329,9 +1803,11 @@ async def text_handler(message: Message):
         if not results:
 
             await message.answer(
-                "⚠️ На найближчі 2 години "
-                "не знайшов зручного прямого рейсу.\n\n"
-                "🔬 Для діагностики відправ /debugroute"
+                "⚠️ За статичним GTFS-розкладом "
+                "зараз не бачу зручного прямого рейсу.\n\n"
+                "Ми вже знаємо, що цей розклад "
+                "не відображає весь транспорт у реальному часі.\n\n"
+                "🛰 Наступний етап — GPS DozoR."
             )
 
             return
@@ -1342,10 +1818,10 @@ async def text_handler(message: Message):
         now, _ = current_time_info()
 
         lines = [
-            "⚡ Найкращий варіант зараз",
+            "⚡ ЗНАЙШОВ ВАРІАНТ",
             "",
-            f"🕙 Зараз: {now.strftime('%H:%M')}",
-            f"🏁 Куди: {text}",
+            f"🏁 {text}",
+            f"🕙 Зараз {now.strftime('%H:%M')}",
             "",
             f"🚌 Маршрут №{route['number']}",
         ]
@@ -1353,16 +1829,16 @@ async def text_handler(message: Message):
         if route["headsign"]:
 
             lines.append(
-                f"➡️ Напрямок: "
-                f"{route['headsign']}"
+                f"➡️ {route['headsign']}"
             )
 
         lines.extend(
             [
                 "",
                 (
-                    f"🚶 {round(best['origin']['distance'])} м "
-                    f"до «{best['origin']['name']}»"
+                    f"🚶 До зупинки "
+                    f"«{best['origin']['name']}» — "
+                    f"{round(best['origin']['distance'])} м"
                 ),
                 (
                     f"   ≈ "
@@ -1370,11 +1846,11 @@ async def text_handler(message: Message):
                 ),
                 "",
                 (
-                    f"🕙 Рейс за розкладом: "
+                    f"🕙 За GTFS: "
                     f"{seconds_to_clock(best['departure'])}"
                 ),
                 (
-                    f"⌛ Очікування після приходу: "
+                    f"⌛ Очікування: "
                     f"≈ {format_minutes(best['wait_minutes'])}"
                 ),
                 "",
@@ -1388,26 +1864,21 @@ async def text_handler(message: Message):
                 ),
                 "",
                 (
-                    f"🚏 Виходь: "
+                    f"🚏 Виходити: "
                     f"«{best['destination']['name']}»"
                 ),
                 (
-                    f"🚶 Ще "
-                    f"{round(best['destination']['distance'])} м "
-                    f"≈ {format_minutes(best['walk_from_minutes'])}"
+                    f"🚶 Звідти ще "
+                    f"{round(best['destination']['distance'])} м"
                 ),
                 "",
                 (
-                    f"🏁 Прибуття приблизно: "
-                    f"{seconds_to_clock(best['arrival'] + best['walk_from_minutes'] * 60)}"
-                ),
-                (
-                    f"⏱ Разом від зараз: "
+                    f"⏱ Орієнтовно разом: "
                     f"{format_minutes(best['total_minutes'])}"
                 ),
                 "",
-                "ℹ️ Це плановий GTFS-розклад.",
-                "GPS транспорту поки не враховується.",
+                "ℹ️ Поки що це дані статичного GTFS.",
+                "🛰 GPS транспорту підключаємо окремо.",
             ]
         )
 
@@ -1418,7 +1889,7 @@ async def text_handler(message: Message):
             lines.extend(
                 [
                     "",
-                    "🔄 Інші варіанти:",
+                    "🔄 Ще варіанти:",
                 ]
             )
 
@@ -1437,8 +1908,8 @@ async def text_handler(message: Message):
         return
 
     await message.answer(
-        "🔄 Для нового маршруту натисни /start.\n\n"
-        "🔬 Або відправ /debugroute для діагностики."
+        "🧭 Хочеш прокласти новий маршрут?\n"
+        "Натисни /start"
     )
 
 
@@ -1447,8 +1918,9 @@ async def text_handler(message: Message):
 # ==================================================
 
 async def main():
+
     print(
-        "MENI-TUDY DEBUG ROUTE START",
+        "MENI-TUDY GPS DEBUG START",
         flush=True,
     )
 
