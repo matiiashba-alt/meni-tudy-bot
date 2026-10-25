@@ -24,14 +24,15 @@ if not TOKEN:
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-users = {}
-
 GTFS_URL = "https://city.dozor.tech/iv-frankivsk/gtfs/static.zip"
 
-gtfs_stops = []
-gtfs_routes = {}
-gtfs_trips = {}
-trip_stops = defaultdict(list)
+users = {}
+
+stops = {}
+routes = {}
+trips = {}
+trip_sequences = {}
+stop_to_trips = defaultdict(list)
 
 
 location_keyboard = ReplyKeyboardMarkup(
@@ -52,37 +53,38 @@ location_keyboard = ReplyKeyboardMarkup(
 )
 
 
-# --------------------------------------------------
+# ==================================================
 # ВІДСТАНЬ
-# --------------------------------------------------
+# ==================================================
 
 def distance_meters(lat1, lon1, lat2, lon2):
     radius = 6371000
 
-    phi1 = math.radians(lat1)
-    phi2 = math.radians(lat2)
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
 
-    delta_phi = math.radians(lat2 - lat1)
-    delta_lambda = math.radians(lon2 - lon1)
+    dp_lat = math.radians(lat2 - lat1)
+    dp_lon = math.radians(lon2 - lon1)
 
     a = (
-        math.sin(delta_phi / 2) ** 2
-        + math.cos(phi1)
-        * math.cos(phi2)
-        * math.sin(delta_lambda / 2) ** 2
+        math.sin(dp_lat / 2) ** 2
+        + math.cos(p1)
+        * math.cos(p2)
+        * math.sin(dp_lon / 2) ** 2
     )
 
-    c = 2 * math.atan2(
-        math.sqrt(a),
-        math.sqrt(1 - a),
+    return radius * (
+        2
+        * math.atan2(
+            math.sqrt(a),
+            math.sqrt(1 - a),
+        )
     )
 
-    return radius * c
 
-
-# --------------------------------------------------
+# ==================================================
 # ГЕОКОДУВАННЯ
-# --------------------------------------------------
+# ==================================================
 
 async def geocode_address(address):
     url = "https://nominatim.openstreetmap.org/search"
@@ -102,8 +104,8 @@ async def geocode_address(address):
 
     try:
         async with aiohttp.ClientSession(
-            timeout=timeout,
             headers=headers,
+            timeout=timeout,
         ) as session:
 
             async with session.get(
@@ -119,11 +121,9 @@ async def geocode_address(address):
                 if not data:
                     return None
 
-                result = data[0]
-
                 return {
-                    "latitude": float(result["lat"]),
-                    "longitude": float(result["lon"]),
+                    "latitude": float(data[0]["lat"]),
+                    "longitude": float(data[0]["lon"]),
                 }
 
     except Exception as error:
@@ -134,36 +134,27 @@ async def geocode_address(address):
         return None
 
 
-# --------------------------------------------------
-# ЧИТАННЯ CSV ІЗ GTFS
-# --------------------------------------------------
+# ==================================================
+# ЧИТАННЯ GTFS
+# ==================================================
 
-def read_gtfs_csv(archive, filename):
+def read_csv_from_zip(archive, filename):
     with archive.open(filename) as file:
-        text_file = io.TextIOWrapper(
+        wrapper = io.TextIOWrapper(
             file,
             encoding="utf-8-sig",
         )
+        return list(csv.DictReader(wrapper))
 
-        return list(
-            csv.DictReader(text_file)
-        )
-
-
-# --------------------------------------------------
-# ЗАВАНТАЖЕННЯ GTFS
-# --------------------------------------------------
 
 async def load_gtfs():
-    global gtfs_stops
-    global gtfs_routes
-    global gtfs_trips
-    global trip_stops
+    global stops
+    global routes
+    global trips
+    global trip_sequences
+    global stop_to_trips
 
-    print(
-        "Downloading Ivano-Frankivsk GTFS...",
-        flush=True,
-    )
+    print("GTFS: downloading...", flush=True)
 
     headers = {
         "User-Agent": "MeniTudyTelegramBot/1.0"
@@ -173,8 +164,8 @@ async def load_gtfs():
 
     try:
         async with aiohttp.ClientSession(
-            timeout=timeout,
             headers=headers,
+            timeout=timeout,
         ) as session:
 
             async with session.get(
@@ -183,7 +174,7 @@ async def load_gtfs():
 
                 if response.status != 200:
                     print(
-                        f"GTFS HTTP error: {response.status}",
+                        f"GTFS HTTP {response.status}",
                         flush=True,
                     )
                     return
@@ -194,76 +185,53 @@ async def load_gtfs():
             io.BytesIO(content)
         )
 
-        required_files = [
-            "stops.txt",
-            "routes.txt",
-            "trips.txt",
-            "stop_times.txt",
-        ]
-
-        for filename in required_files:
-            if filename not in archive.namelist():
-                print(
-                    f"GTFS missing: {filename}",
-                    flush=True,
-                )
-                return
-
-        # --------------------------
         # ЗУПИНКИ
-        # --------------------------
 
-        stops_rows = read_gtfs_csv(
+        stop_rows = read_csv_from_zip(
             archive,
             "stops.txt",
         )
 
-        stops = []
+        new_stops = {}
 
-        for row in stops_rows:
+        for row in stop_rows:
             try:
-                stops.append(
-                    {
-                        "id": row["stop_id"],
-                        "name": row.get(
-                            "stop_name",
-                            "Без назви",
-                        ),
-                        "latitude": float(
-                            row["stop_lat"]
-                        ),
-                        "longitude": float(
-                            row["stop_lon"]
-                        ),
-                    }
-                )
-            except (
-                ValueError,
-                TypeError,
-                KeyError,
-            ):
+                stop_id = row["stop_id"]
+
+                new_stops[stop_id] = {
+                    "id": stop_id,
+                    "name": row.get(
+                        "stop_name",
+                        "Без назви",
+                    ),
+                    "latitude": float(
+                        row["stop_lat"]
+                    ),
+                    "longitude": float(
+                        row["stop_lon"]
+                    ),
+                }
+            except Exception:
                 continue
 
-        gtfs_stops = stops
+        stops = new_stops
 
-        # --------------------------
         # МАРШРУТИ
-        # --------------------------
 
-        routes_rows = read_gtfs_csv(
+        route_rows = read_csv_from_zip(
             archive,
             "routes.txt",
         )
 
-        routes = {}
+        new_routes = {}
 
-        for row in routes_rows:
+        for row in route_rows:
             route_id = row.get("route_id")
 
             if not route_id:
                 continue
 
-            routes[route_id] = {
+            new_routes[route_id] = {
                 "short_name": row.get(
                     "route_short_name",
                     "",
@@ -278,28 +246,28 @@ async def load_gtfs():
                 ),
             }
 
-        gtfs_routes = routes
+        routes = new_routes
 
-        # --------------------------
         # РЕЙСИ
-        # --------------------------
 
-        trips_rows = read_gtfs_csv(
+        trip_rows = read_csv_from_zip(
             archive,
             "trips.txt",
         )
 
-        trips = {}
+        new_trips = {}
 
-        for row in trips_rows:
+        for row in trip_rows:
             trip_id = row.get("trip_id")
-            route_id = row.get("route_id")
 
-            if not trip_id or not route_id:
+            if not trip_id:
                 continue
 
-            trips[trip_id] = {
-                "route_id": route_id,
+            new_trips[trip_id] = {
+                "route_id": row.get(
+                    "route_id",
+                    "",
+                ),
                 "headsign": row.get(
                     "trip_headsign",
                     "",
@@ -310,20 +278,18 @@ async def load_gtfs():
                 ),
             }
 
-        gtfs_trips = trips
+        trips = new_trips
 
-        # --------------------------
         # ПОСЛІДОВНІСТЬ ЗУПИНОК
-        # --------------------------
 
-        stop_times_rows = read_gtfs_csv(
+        stop_time_rows = read_csv_from_zip(
             archive,
             "stop_times.txt",
         )
 
-        stops_by_trip = defaultdict(list)
+        raw_sequences = defaultdict(list)
 
-        for row in stop_times_rows:
+        for row in stop_time_rows:
             trip_id = row.get("trip_id")
             stop_id = row.get("stop_id")
 
@@ -334,54 +300,76 @@ async def load_gtfs():
                 sequence = int(
                     row.get(
                         "stop_sequence",
-                        0,
+                        "0",
                     )
                 )
             except ValueError:
                 continue
 
-            stops_by_trip[trip_id].append(
+            raw_sequences[trip_id].append(
                 (
                     sequence,
                     stop_id,
                 )
             )
 
-        for trip_id in stops_by_trip:
-            stops_by_trip[trip_id].sort(
-                key=lambda item: item[0]
+        new_sequences = {}
+        new_stop_to_trips = defaultdict(list)
+
+        for trip_id, sequence in raw_sequences.items():
+
+            sequence.sort(
+                key=lambda x: x[0]
             )
 
-        trip_stops = stops_by_trip
+            stop_ids = [
+                stop_id
+                for _, stop_id in sequence
+            ]
+
+            new_sequences[trip_id] = stop_ids
+
+            for position, stop_id in enumerate(
+                stop_ids
+            ):
+                new_stop_to_trips[stop_id].append(
+                    (
+                        trip_id,
+                        position,
+                    )
+                )
+
+        trip_sequences = new_sequences
+        stop_to_trips = new_stop_to_trips
 
         print(
-            f"GTFS loaded: "
-            f"{len(gtfs_stops)} stops, "
-            f"{len(gtfs_routes)} routes, "
-            f"{len(gtfs_trips)} trips",
+            f"GTFS READY: "
+            f"{len(stops)} stops / "
+            f"{len(routes)} routes / "
+            f"{len(trips)} trips",
             flush=True,
         )
 
     except Exception as error:
         print(
-            f"GTFS load error: {error}",
+            f"GTFS ERROR: {error}",
             flush=True,
         )
 
 
-# --------------------------------------------------
-# НАЙБЛИЖЧІ ЗУПИНКИ
-# --------------------------------------------------
+# ==================================================
+# ЗУПИНКИ ПОРУЧ
+# ==================================================
 
-def find_nearest_stops(
+def nearby_stops(
     latitude,
     longitude,
-    limit=5,
-    max_distance=700,
+    radius=1200,
+    limit=20,
 ):
-    results = []
+    result = []
 
-    for stop in gtfs_stops:
+    for stop in stops.values():
 
         distance = distance_meters(
             latitude,
@@ -390,137 +378,331 @@ def find_nearest_stops(
             stop["longitude"],
         )
 
-        if distance <= max_distance:
+        if distance <= radius:
             item = stop.copy()
             item["distance"] = distance
-            results.append(item)
+            result.append(item)
 
-    results.sort(
-        key=lambda item: item["distance"]
+    result.sort(
+        key=lambda x: x["distance"]
     )
 
-    return results[:limit]
+    return result[:limit]
 
 
-# --------------------------------------------------
-# ПОШУК ПРЯМОГО МАРШРУТУ
-# --------------------------------------------------
+# ==================================================
+# ІНФОРМАЦІЯ ПРО МАРШРУТ
+# ==================================================
+
+def route_info(trip_id):
+    trip = trips.get(trip_id)
+
+    if not trip:
+        return None
+
+    route = routes.get(
+        trip["route_id"]
+    )
+
+    if not route:
+        return None
+
+    number = (
+        route["short_name"]
+        or route["long_name"]
+        or trip["route_id"]
+    )
+
+    return {
+        "trip_id": trip_id,
+        "route_id": trip["route_id"],
+        "number": number,
+        "name": route["long_name"],
+        "headsign": trip["headsign"],
+    }
+
+
+# ==================================================
+# ПРЯМИЙ МАРШРУТ
+# ==================================================
 
 def find_direct_routes(
-    origin_stops,
-    destination_stops,
+    origin_candidates,
+    destination_candidates,
 ):
-    if not origin_stops or not destination_stops:
-        return []
+    results = []
 
-    origin_ids = {
+    destination_map = {
         stop["id"]: stop
-        for stop in origin_stops
+        for stop in destination_candidates
     }
+
+    for origin in origin_candidates:
+
+        connections = stop_to_trips.get(
+            origin["id"],
+            [],
+        )
+
+        for trip_id, origin_position in connections:
+
+            sequence = trip_sequences.get(
+                trip_id,
+                [],
+            )
+
+            if not sequence:
+                continue
+
+            for destination_position in range(
+                origin_position + 1,
+                len(sequence),
+            ):
+
+                destination_id = sequence[
+                    destination_position
+                ]
+
+                if destination_id not in destination_map:
+                    continue
+
+                destination = destination_map[
+                    destination_id
+                ]
+
+                info = route_info(trip_id)
+
+                if not info:
+                    continue
+
+                stop_count = (
+                    destination_position
+                    - origin_position
+                )
+
+                score = (
+                    origin["distance"] * 1.5
+                    + destination["distance"] * 1.5
+                    + stop_count * 40
+                )
+
+                results.append(
+                    {
+                        "score": score,
+                        "route": info,
+                        "origin": origin,
+                        "destination": destination,
+                        "stop_count": stop_count,
+                    }
+                )
+
+                break
+
+    best = {}
+
+    for item in results:
+
+        key = (
+            item["route"]["route_id"],
+            item["origin"]["id"],
+            item["destination"]["id"],
+        )
+
+        old = best.get(key)
+
+        if (
+            old is None
+            or item["score"] < old["score"]
+        ):
+            best[key] = item
+
+    result = list(best.values())
+
+    result.sort(
+        key=lambda x: x["score"]
+    )
+
+    return result
+
+
+# ==================================================
+# ПОШУК ОДНІЄЇ ПЕРЕСАДКИ
+# ==================================================
+
+def find_transfer_routes(
+    origin_candidates,
+    destination_candidates,
+):
+    results = []
 
     destination_ids = {
         stop["id"]: stop
-        for stop in destination_stops
+        for stop in destination_candidates
     }
 
-    found = {}
+    for origin in origin_candidates:
 
-    for trip_id, sequence in trip_stops.items():
-
-        trip = gtfs_trips.get(trip_id)
-
-        if not trip:
-            continue
-
-        origin_match = None
-        destination_match = None
-
-        for index, (_, stop_id) in enumerate(sequence):
-
-            if (
-                origin_match is None
-                and stop_id in origin_ids
-            ):
-                origin_match = (
-                    index,
-                    stop_id,
-                )
-
-            if (
-                origin_match is not None
-                and stop_id in destination_ids
-                and index > origin_match[0]
-            ):
-                destination_match = (
-                    index,
-                    stop_id,
-                )
-                break
-
-        if (
-            origin_match is None
-            or destination_match is None
-        ):
-            continue
-
-        route_id = trip["route_id"]
-        route = gtfs_routes.get(route_id)
-
-        if not route:
-            continue
-
-        origin_stop = origin_ids[
-            origin_match[1]
-        ]
-
-        destination_stop = destination_ids[
-            destination_match[1]
-        ]
-
-        stop_count = (
-            destination_match[0]
-            - origin_match[0]
+        first_connections = stop_to_trips.get(
+            origin["id"],
+            [],
         )
+
+        for first_trip_id, first_start_pos in first_connections:
+
+            first_sequence = trip_sequences.get(
+                first_trip_id,
+                [],
+            )
+
+            first_info = route_info(
+                first_trip_id
+            )
+
+            if not first_sequence or not first_info:
+                continue
+
+            # Не розглядаємо сотні зупинок.
+            # Достатньо наступних 35.
+            first_end = min(
+                len(first_sequence),
+                first_start_pos + 36,
+            )
+
+            for transfer_pos in range(
+                first_start_pos + 1,
+                first_end,
+            ):
+
+                transfer_stop_id = first_sequence[
+                    transfer_pos
+                ]
+
+                transfer_stop = stops.get(
+                    transfer_stop_id
+                )
+
+                if not transfer_stop:
+                    continue
+
+                second_connections = stop_to_trips.get(
+                    transfer_stop_id,
+                    [],
+                )
+
+                for (
+                    second_trip_id,
+                    second_start_pos,
+                ) in second_connections:
+
+                    second_info = route_info(
+                        second_trip_id
+                    )
+
+                    if not second_info:
+                        continue
+
+                    # Пересадка на той самий маршрут
+                    # нам не потрібна.
+                    if (
+                        second_info["route_id"]
+                        == first_info["route_id"]
+                    ):
+                        continue
+
+                    second_sequence = trip_sequences.get(
+                        second_trip_id,
+                        [],
+                    )
+
+                    if not second_sequence:
+                        continue
+
+                    for destination_pos in range(
+                        second_start_pos + 1,
+                        len(second_sequence),
+                    ):
+
+                        destination_id = second_sequence[
+                            destination_pos
+                        ]
+
+                        if destination_id not in destination_ids:
+                            continue
+
+                        destination = destination_ids[
+                            destination_id
+                        ]
+
+                        first_stop_count = (
+                            transfer_pos
+                            - first_start_pos
+                        )
+
+                        second_stop_count = (
+                            destination_pos
+                            - second_start_pos
+                        )
+
+                        total_stops = (
+                            first_stop_count
+                            + second_stop_count
+                        )
+
+                        score = (
+                            origin["distance"] * 1.5
+                            + destination["distance"] * 1.5
+                            + total_stops * 40
+                            + 600
+                        )
+
+                        results.append(
+                            {
+                                "score": score,
+                                "first_route": first_info,
+                                "second_route": second_info,
+                                "origin": origin,
+                                "transfer": transfer_stop,
+                                "destination": destination,
+                                "first_stop_count": first_stop_count,
+                                "second_stop_count": second_stop_count,
+                            }
+                        )
+
+                        break
+
+    # Прибираємо дублікати комбінацій маршрутів
+    best = {}
+
+    for item in results:
 
         key = (
-            route_id,
-            origin_stop["id"],
-            destination_stop["id"],
+            item["first_route"]["route_id"],
+            item["second_route"]["route_id"],
+            item["origin"]["id"],
+            item["transfer"]["id"],
+            item["destination"]["id"],
         )
 
-        candidate = {
-            "route_id": route_id,
-            "route_number": (
-                route["short_name"]
-                or route["long_name"]
-                or route_id
-            ),
-            "route_name": route["long_name"],
-            "headsign": trip["headsign"],
-            "origin_stop": origin_stop,
-            "destination_stop": destination_stop,
-            "stop_count": stop_count,
-        }
+        old = best.get(key)
 
-        if key not in found:
-            found[key] = candidate
+        if (
+            old is None
+            or item["score"] < old["score"]
+        ):
+            best[key] = item
 
-    results = list(found.values())
+    result = list(best.values())
 
-    results.sort(
-        key=lambda item: (
-            item["origin_stop"]["distance"]
-            + item["destination_stop"]["distance"],
-            item["stop_count"],
-        )
+    result.sort(
+        key=lambda x: x["score"]
     )
 
-    return results
+    return result
 
 
-# --------------------------------------------------
+# ==================================================
 # /START
-# --------------------------------------------------
+# ==================================================
 
 @dp.message(CommandStart())
 async def start_handler(message: Message):
@@ -541,9 +723,9 @@ async def start_handler(message: Message):
     )
 
 
-# --------------------------------------------------
+# ==================================================
 # ГЕОЛОКАЦІЯ
-# --------------------------------------------------
+# ==================================================
 
 @dp.message(F.location)
 async def location_handler(message: Message):
@@ -552,7 +734,7 @@ async def location_handler(message: Message):
     latitude = message.location.latitude
     longitude = message.location.longitude
 
-    origin_stops = find_nearest_stops(
+    origin_stops = nearby_stops(
         latitude,
         longitude,
     )
@@ -566,6 +748,7 @@ async def location_handler(message: Message):
     }
 
     if origin_stops:
+
         nearest = origin_stops[0]
 
         stop_text = (
@@ -573,7 +756,9 @@ async def location_handler(message: Message):
             f"«{nearest['name']}»\n"
             f"🚶 {round(nearest['distance'])} м"
         )
+
     else:
+
         stop_text = (
             "\n\n⚠️ Не знайшов зупинок поруч."
         )
@@ -587,9 +772,9 @@ async def location_handler(message: Message):
     )
 
 
-# --------------------------------------------------
+# ==================================================
 # ТЕКСТ
-# --------------------------------------------------
+# ==================================================
 
 @dp.message(F.text)
 async def text_handler(message: Message):
@@ -621,9 +806,9 @@ async def text_handler(message: Message):
 
     step = users[user_id].get("step")
 
-    # --------------------------------------------------
+    # ----------------------------------------------
     # АДРЕСА СТАРТУ
-    # --------------------------------------------------
+    # ----------------------------------------------
 
     if step == "waiting_origin_address":
 
@@ -631,17 +816,20 @@ async def text_handler(message: Message):
             "🔎 Шукаю адресу..."
         )
 
-        result = await geocode_address(text)
+        result = await geocode_address(
+            text
+        )
 
         if result is None:
 
             await message.answer(
-                "❌ Не вдалося знайти цю адресу."
+                "❌ Не вдалося знайти адресу.\n\n"
+                "Спробуй написати її точніше."
             )
 
             return
 
-        origin_stops = find_nearest_stops(
+        origin_stops = nearby_stops(
             result["latitude"],
             result["longitude"],
         )
@@ -656,6 +844,7 @@ async def text_handler(message: Message):
         }
 
         if origin_stops:
+
             nearest = origin_stops[0]
 
             stop_text = (
@@ -663,7 +852,9 @@ async def text_handler(message: Message):
                 f"«{nearest['name']}» — "
                 f"{round(nearest['distance'])} м"
             )
+
         else:
+
             stop_text = (
                 "\n\n⚠️ Не знайшов зупинок поруч."
             )
@@ -677,17 +868,19 @@ async def text_handler(message: Message):
 
         return
 
-    # --------------------------------------------------
-    # ПРИЗНАЧЕННЯ
-    # --------------------------------------------------
+    # ----------------------------------------------
+    # ПУНКТ ПРИЗНАЧЕННЯ
+    # ----------------------------------------------
 
     if step == "waiting_destination":
 
         await message.answer(
-            "🔎 Шукаю адресу та транспорт..."
+            "🔎 Шукаю найзручніший маршрут..."
         )
 
-        result = await geocode_address(text)
+        result = await geocode_address(
+            text
+        )
 
         if result is None:
 
@@ -698,119 +891,184 @@ async def text_handler(message: Message):
 
             return
 
-        destination_stops = find_nearest_stops(
+        destination_stops = nearby_stops(
             result["latitude"],
             result["longitude"],
         )
 
-        origin_stops = users[user_id].get(
+        origin_stops = users[
+            user_id
+        ].get(
             "origin_stops",
             [],
         )
 
-        routes = find_direct_routes(
+        if not origin_stops:
+
+            await message.answer(
+                "❌ Не знайшов зупинок "
+                "біля точки старту."
+            )
+
+            return
+
+        if not destination_stops:
+
+            await message.answer(
+                "❌ Не знайшов зупинок "
+                "біля пункту призначення."
+            )
+
+            return
+
+        # Спочатку шукаємо прямі маршрути
+        direct_routes = find_direct_routes(
             origin_stops,
             destination_stops,
         )
 
         users[user_id]["step"] = "done"
 
-        if users[user_id]["origin_type"] == "location":
-            origin_text = "Твоя геолокація 📍"
-        else:
-            origin_text = users[user_id]["origin"]
+        if direct_routes:
 
-        if not routes:
+            best_routes = direct_routes[:3]
 
-            origin_nearest = (
-                origin_stops[0]
-                if origin_stops
-                else None
-            )
+            lines = [
+                "✅ Знайшов прямий маршрут!",
+                "",
+                f"🏁 Куди: {text}",
+            ]
 
-            destination_nearest = (
-                destination_stops[0]
-                if destination_stops
-                else None
-            )
+            for index, item in enumerate(
+                best_routes,
+                start=1,
+            ):
 
-            details = ""
+                route = item["route"]
 
-            if origin_nearest:
-                details += (
-                    "\n\n🚏 Біля тебе:\n"
-                    f"«{origin_nearest['name']}» — "
-                    f"{round(origin_nearest['distance'])} м"
-                )
-
-            if destination_nearest:
-                details += (
-                    "\n\n🚏 Біля пункту призначення:\n"
-                    f"«{destination_nearest['name']}» — "
-                    f"{round(destination_nearest['distance'])} м"
+                lines.extend(
+                    [
+                        "",
+                        f"━━ Варіант {index} ━━",
+                        f"🚌 Маршрут №{route['number']}",
+                        (
+                            f"➡️ Напрямок: {route['headsign']}"
+                            if route["headsign"]
+                            else "➡️ Напрямок: за маршрутом"
+                        ),
+                        (
+                            f"🚶 Пройди "
+                            f"{round(item['origin']['distance'])} м "
+                            f"до «{item['origin']['name']}»"
+                        ),
+                        (
+                            f"🚌 Їдь приблизно "
+                            f"{item['stop_count']} зуп."
+                        ),
+                        (
+                            f"🚏 Виходь на "
+                            f"«{item['destination']['name']}»"
+                        ),
+                        (
+                            f"🚶 До адреси залишиться "
+                            f"{round(item['destination']['distance'])} м"
+                        ),
+                    ]
                 )
 
             await message.answer(
-                "⚠️ Прямого маршруту між "
-                "найближчими зупинками не знайшов."
-                + details
-                + "\n\n🔄 Наступним етапом "
-                "додамо маршрути з пересадкою."
+                "\n".join(lines)
             )
 
             return
 
-        # Показуємо максимум 3 найкращі варіанти
-        best_routes = routes[:3]
+        # Якщо прямого немає — одна пересадка
+
+        await message.answer(
+            "🔄 Прямого маршруту не знайшов. "
+            "Шукаю варіант з однією пересадкою..."
+        )
+
+        transfer_routes = find_transfer_routes(
+            origin_stops,
+            destination_stops,
+        )
+
+        if not transfer_routes:
+
+            await message.answer(
+                "⚠️ Не вдалося знайти зручний "
+                "маршрут навіть з однією пересадкою.\n\n"
+                "Спробуй іншу адресу або "
+                "трохи пізніше."
+            )
+
+            return
+
+        best = transfer_routes[0]
+
+        first = best["first_route"]
+        second = best["second_route"]
 
         lines = [
-            "🚌 Знайшов прямі маршрути!",
+            "🚌 Знайшов маршрут з пересадкою!",
             "",
-            f"📍 Звідки: {origin_text}",
             f"🏁 Куди: {text}",
+            "",
+            "1️⃣ Перший транспорт",
+            f"🚌 Маршрут №{first['number']}",
         ]
 
-        for number, route in enumerate(
-            best_routes,
-            start=1,
-        ):
-            lines.extend(
-                [
-                    "",
-                    f"━━ Варіант {number} ━━",
-                    f"🚌 Маршрут №{route['route_number']}",
-                    (
-                        f"➡️ Напрямок: {route['headsign']}"
-                        if route["headsign"]
-                        else "➡️ Напрямок: за маршрутом"
-                    ),
-                    (
-                        f"🚶 {round(route['origin_stop']['distance'])} м "
-                        f"до «{route['origin_stop']['name']}»"
-                    ),
-                    (
-                        f"🚏 Виходь: "
-                        f"«{route['destination_stop']['name']}»"
-                    ),
-                    (
-                        f"🛑 Приблизно "
-                        f"{route['stop_count']} зуп."
-                    ),
-                    (
-                        f"🚶 Потім "
-                        f"{round(route['destination_stop']['distance'])} м "
-                        f"до адреси."
-                    ),
-                ]
+        if first["headsign"]:
+            lines.append(
+                f"➡️ Напрямок: {first['headsign']}"
             )
 
         lines.extend(
             [
+                (
+                    f"🚶 Пройди "
+                    f"{round(best['origin']['distance'])} м "
+                    f"до «{best['origin']['name']}»"
+                ),
+                (
+                    f"🚌 Їдь приблизно "
+                    f"{best['first_stop_count']} зуп."
+                ),
                 "",
-                "ℹ️ Поки це маршрут за офіційною "
-                "схемою GTFS.",
-                "Наступним кроком підключимо GPS "
-                "транспорту та час прибуття.",
+                "🔄 Пересадка",
+                (
+                    f"🚏 На зупинці "
+                    f"«{best['transfer']['name']}»"
+                ),
+                "",
+                "2️⃣ Другий транспорт",
+                f"🚌 Маршрут №{second['number']}",
+            ]
+        )
+
+        if second["headsign"]:
+            lines.append(
+                f"➡️ Напрямок: {second['headsign']}"
+            )
+
+        lines.extend(
+            [
+                (
+                    f"🚌 Їдь приблизно "
+                    f"{best['second_stop_count']} зуп."
+                ),
+                (
+                    f"🚏 Виходь на "
+                    f"«{best['destination']['name']}»"
+                ),
+                (
+                    f"🚶 До адреси залишиться "
+                    f"{round(best['destination']['distance'])} м"
+                ),
+                "",
+                "ℹ️ Маршрут розраховано "
+                "за офіційною схемою GTFS.",
             ]
         )
 
@@ -828,21 +1086,21 @@ async def text_handler(message: Message):
         )
 
 
-# --------------------------------------------------
+# ==================================================
 # ЗАПУСК
-# --------------------------------------------------
+# ==================================================
 
 async def main():
 
     print(
-        "MENI-TUDY ROUTING STARTING...",
+        "MENI-TUDY SMART ROUTING STARTING...",
         flush=True,
     )
 
     await load_gtfs()
 
     print(
-        "MENI-TUDY ROUTING ONLINE",
+        "MENI-TUDY SMART ROUTING ONLINE",
         flush=True,
     )
 
