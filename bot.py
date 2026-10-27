@@ -2645,7 +2645,7 @@ async def all_routes_handler(
 # TEXT
 # ==================================================
 
-@dp.message(F.text)
+@dp.message(F.text, lambda message: (message.from_user.id in form_text_waiting) or (is_admin(message.from_user.id) and message.from_user.id in form_drafts))
 async def form_text_input_handler(message: Message):
     uid = message.from_user.id
     text = message.text.strip()
@@ -2699,7 +2699,7 @@ async def form_text_input_handler(message: Message):
 
 
 
-@dp.message(F.text)
+@dp.message(F.text != "📝 Форми та опитування")
 async def text_handler(
     message: Message
 ):
