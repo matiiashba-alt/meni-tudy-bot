@@ -21,6 +21,9 @@ from aiogram.types import (
     Message,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    CallbackQuery,
 )
 
 # ==================================================
@@ -127,6 +130,7 @@ admin_keyboard = ReplyKeyboardMarkup(
                 text="🔧 Дебаг"
             ),
         ],
+        [KeyboardButton(text="📝 Форми та опитування")],
         [
             KeyboardButton(
                 text="❌ Закрити адмін-панель"
@@ -2244,7 +2248,8 @@ async def admin_handler(
         "📊 Статистика — показники бота\n"
         "👥 Користувачі — база користувачів\n"
         "📢 Розсилка — повідомлення користувачам\n"
-        "🔧 Дебаг — стан GTFS та GPS\n\n"
+        "🔧 Дебаг — стан GTFS та GPS\n"
+        "📝 Форми та опитування — запитання й відповіді\n\n"
         "Обери потрібний розділ 👇",
         reply_markup=admin_keyboard,
     )
@@ -2641,6 +2646,60 @@ async def all_routes_handler(
 # ==================================================
 
 @dp.message(F.text)
+async def form_text_input_handler(message: Message):
+    uid = message.from_user.id
+    text = message.text.strip()
+    draft = form_drafts.get(uid) if is_admin(uid) else None
+    if draft:
+        if text.casefold() == 'скасувати':
+            form_drafts.pop(uid, None)
+            await message.answer("Скасовано", reply_markup=admin_keyboard)
+            return
+        if not text or len(text) > 1000:
+            await message.answer("Введи текст від 1 до 1000 символів")
+            return
+        action = draft['action']
+        fid = draft.get('id')
+        if action == 'new':
+            fid = await db_pool.fetchval("INSERT INTO bot_forms(question,mode) VALUES($1,'text') RETURNING id", text)
+        elif action == 'edit':
+            await db_pool.execute("UPDATE bot_forms SET question=$2 WHERE id=$1 AND status='draft'", fid, text)
+        elif action == 'add':
+            row = await form_get(fid)
+            opts = row['options']
+            if isinstance(opts, str):
+                opts = json.loads(opts)
+            if len(opts) >= 8:
+                await message.answer("Максимум 8 варіантів")
+                return
+            opts.append(text)
+            await db_pool.execute("UPDATE bot_forms SET options=$2::jsonb,mode='mixed' WHERE id=$1 AND status='draft'", fid, json.dumps(opts, ensure_ascii=False))
+        form_drafts.pop(uid, None)
+        await form_show(uid, fid)
+        return
+    fid = form_text_waiting.get(uid)
+    if fid is None:
+        return
+    if text.casefold() == 'скасувати':
+        form_text_waiting.pop(uid, None)
+        await message.answer("Введення відповіді скасовано")
+        return
+    row = await form_get(fid)
+    form_text_waiting.pop(uid, None)
+    if not row or row['status'] not in ('active', 'sending'):
+        await message.answer("Це опитування вже завершено")
+        return
+    if len(text) > 2000:
+        await message.answer("Відповідь завелика (максимум 2000 символів)")
+        return
+    await db_pool.execute("""INSERT INTO bot_form_answers(form_id,telegram_id,answer_type,answer_text)
+        VALUES($1,$2,'text',$3) ON CONFLICT(form_id,telegram_id) DO UPDATE SET
+        answer_type='text',answer_text=excluded.answer_text,answered_at=now()""", fid, uid, text)
+    await message.answer("✅ Дякуємо! Відповідь збережено.")
+
+
+
+@dp.message(F.text)
 async def text_handler(
     message: Message
 ):
@@ -2876,6 +2935,221 @@ async def text_handler(
 
 
 # ==================================================
+# UNIVERSAL FORMS AND POLLS (admin-only management)
+# ==================================================
+
+form_drafts = {}
+form_text_waiting = {}
+form_sending_tasks = {}
+
+
+def form_admin_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Створити форму", callback_data="fm:new")],
+        [InlineKeyboardButton(text="📋 Мої форми", callback_data="fm:list")],
+    ])
+
+
+def form_choice_keyboard(form_id, options, mode):
+    buttons = [[InlineKeyboardButton(text=str(option)[:60], callback_data=f"fa:{form_id}:{i}")]
+               for i, option in enumerate(options)]
+    if mode in ("mixed", "text"):
+        buttons.append([InlineKeyboardButton(text="✍️ Власна відповідь", callback_data=f"fa:{form_id}:t")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def form_manage_keyboard(form_id, status):
+    buttons = []
+    if status == "draft":
+        buttons += [[InlineKeyboardButton(text="✏️ Змінити запитання", callback_data=f"fm:edit:{form_id}")],
+                    [InlineKeyboardButton(text="➕ Додати варіант", callback_data=f"fm:add:{form_id}")],
+                    [InlineKeyboardButton(text="🧹 Прибрати всі варіанти", callback_data=f"fm:clear:{form_id}")],
+                    [InlineKeyboardButton(text="🚀 Почати розсилку", callback_data=f"fm:send:{form_id}")]]
+    else:
+        buttons.append([InlineKeyboardButton(text="📊 Відповіді", callback_data=f"fm:answers:{form_id}")])
+        if status in ("active", "sending"):
+            buttons.append([InlineKeyboardButton(text="⏹ Зупинити", callback_data=f"fm:stop:{form_id}")])
+        if status == "sending":
+            buttons.append([InlineKeyboardButton(text="❌ Скасувати розсилку", callback_data=f"fm:cancel:{form_id}")])
+        buttons.append([InlineKeyboardButton(text="🗑 Видалити повідомлення", callback_data=f"fm:delete:{form_id}")])
+    buttons.append([InlineKeyboardButton(text="📋 Усі форми", callback_data="fm:list")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def form_get(form_id):
+    return await db_pool.fetchrow("SELECT * FROM bot_forms WHERE id=$1", form_id)
+
+
+async def form_show(chat_id, form_id):
+    form = await form_get(form_id)
+    if not form:
+        await bot.send_message(chat_id, "Форму не знайдено.")
+        return
+    count = await db_pool.fetchval("SELECT count(*) FROM bot_form_answers WHERE form_id=$1", form_id)
+    sent = await db_pool.fetchval("SELECT count(*) FROM bot_form_deliveries WHERE form_id=$1 AND status='sent'", form_id)
+    opts = form['options']
+    if isinstance(opts, str):
+        opts = json.loads(opts)
+    desc = "\n".join(f"{i+1}. {v}" for i, v in enumerate(opts)) or "(лише текстова відповідь)"
+    await bot.send_message(chat_id, f"📝 Форма #{form_id}\n\n{form['question']}\n\n{desc}\n\nСтатус: {form['status']}\n📨 Надіслано: {sent}\n💬 Відповіли: {count}", reply_markup=form_manage_keyboard(form_id, form['status']))
+
+
+async def form_broadcast(form_id):
+    try:
+        recipients = await get_broadcast_user_ids()
+        for uid in recipients:
+            existing = await db_pool.fetchval("SELECT status FROM bot_form_deliveries WHERE form_id=$1 AND telegram_id=$2", form_id, uid)
+            if existing in ("sent", "deleted"):
+                continue
+            row = await form_get(form_id)
+            if not row or row['status'] != 'sending':
+                break
+            options = row['options']
+            if isinstance(options, str):
+                options = json.loads(options)
+            mode = row['mode']
+            try:
+                msg = await bot.send_message(uid, "📝 Запитання від «МЕНІ ТУДИ»\n\n" + row['question'], reply_markup=form_choice_keyboard(form_id, options, mode))
+                await db_pool.execute("""INSERT INTO bot_form_deliveries(form_id,telegram_id,message_id,status,delivered_at)
+                    VALUES($1,$2,$3,'sent',now()) ON CONFLICT(form_id,telegram_id) DO UPDATE
+                    SET message_id=excluded.message_id,status='sent',delivered_at=now()""", form_id, uid, msg.message_id)
+            except TelegramForbiddenError:
+                await mark_user_blocked(uid)
+                await db_pool.execute("INSERT INTO bot_form_deliveries(form_id,telegram_id,status) VALUES($1,$2,'failed') ON CONFLICT(form_id,telegram_id) DO UPDATE SET status='failed'", form_id, uid)
+            except Exception as exc:
+                print(f"FORM SEND {form_id} {uid}: {exc}", flush=True)
+            await asyncio.sleep(0.075)
+        await db_pool.execute("UPDATE bot_forms SET status='active' WHERE id=$1 AND status='sending'", form_id)
+        await bot.send_message(ADMIN_ID, f"📨 Розсилку форми #{form_id} завершено або зупинено.")
+    except Exception as exc:
+        print(f"FORM BROADCAST FAILED {form_id}: {exc}", flush=True)
+        await bot.send_message(ADMIN_ID, f"⚠️ Помилка розсилки форми #{form_id}. Перевір логи Northflank.")
+    finally:
+        form_sending_tasks.pop(form_id, None)
+
+
+@dp.message(F.text == "📝 Форми та опитування")
+async def form_admin_start(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    if not db_pool:
+        await message.answer("⚠️ Supabase недоступна.")
+        return
+    await message.answer("📝 Форми та опитування", reply_markup=form_admin_menu())
+
+
+@dp.callback_query(F.data.startswith("fm:"))
+async def form_admin_callback(query: CallbackQuery):
+    if not is_admin(query.from_user.id):
+        await query.answer("Недоступно", show_alert=True)
+        return
+    await query.answer()
+    if not db_pool:
+        await bot.send_message(query.from_user.id, "⚠️ База недоступна")
+        return
+    parts = query.data.split(":")
+    action = parts[1]
+    fid = int(parts[2]) if len(parts) > 2 else None
+    if action == "new":
+        form_drafts[query.from_user.id] = {"action": "new"}
+        await bot.send_message(query.from_user.id, "Напиши запитання для нової форми. Для виходу напиши «Скасувати».")
+        return
+    if action == "list":
+        rows = await db_pool.fetch("SELECT id,question,status FROM bot_forms ORDER BY id DESC LIMIT 15")
+        if not rows:
+            await bot.send_message(query.from_user.id, "Форм поки немає.", reply_markup=form_admin_menu())
+            return
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"#{r['id']} {r['question'][:32]} · {r['status']}", callback_data=f"fm:view:{r['id']}")] for r in rows])
+        await bot.send_message(query.from_user.id, "📋 Останні форми:", reply_markup=kb)
+        return
+    row = await form_get(fid)
+    if not row:
+        await bot.send_message(query.from_user.id, "Форму не знайдено")
+        return
+    if action == "view":
+        await form_show(query.from_user.id, fid)
+    elif action in ("edit", "add") and row['status'] == 'draft':
+        form_drafts[query.from_user.id] = {"action": action, "id": fid}
+        await bot.send_message(query.from_user.id, "Напиши нове запитання:" if action == "edit" else "Напиши текст нового варіанта відповіді:")
+    elif action == "clear" and row['status'] == 'draft':
+        await db_pool.execute("UPDATE bot_forms SET options='[]'::jsonb,mode='text' WHERE id=$1", fid)
+        await form_show(query.from_user.id, fid)
+    elif action == "send" and row['status'] == 'draft':
+        await bot.send_message(query.from_user.id, "⚠️ Надіслати форму всім активним користувачам?", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Так, розіслати", callback_data=f"fm:confirm:{fid}")],
+            [InlineKeyboardButton(text="Ні", callback_data=f"fm:view:{fid}")]]))
+    elif action == "confirm" and row['status'] == 'draft':
+        await db_pool.execute("UPDATE bot_forms SET status='sending',started_at=now() WHERE id=$1 AND status='draft'", fid)
+        form_sending_tasks[fid] = asyncio.create_task(form_broadcast(fid))
+        await bot.send_message(query.from_user.id, f"🚀 Розсилка форми #{fid} почалася.")
+    elif action in ("stop", "cancel") and row['status'] in ('active', 'sending'):
+        await db_pool.execute("UPDATE bot_forms SET status=$2,stopped_at=now() WHERE id=$1", fid, 'cancelled' if action == 'cancel' else 'stopped')
+        await bot.send_message(query.from_user.id, "⏹ Форму зупинено. Нові відповіді не приймаються; незавершена розсилка припиняється.")
+    elif action == "answers":
+        rows = await db_pool.fetch("""SELECT a.telegram_id,a.answer_text,a.answered_at,u.username,u.first_name
+            FROM bot_form_answers a LEFT JOIN bot_users u ON u.telegram_id=a.telegram_id
+            WHERE a.form_id=$1 ORDER BY a.answered_at DESC LIMIT 30""", fid)
+        if not rows:
+            await bot.send_message(query.from_user.id, "Відповідей поки немає.")
+            return
+        lines = [f"📊 Відповіді на форму #{fid} (останні 30):"]
+        for r in rows:
+            who = (r['first_name'] or 'Користувач') + (f" @{r['username']}" if r['username'] else '')
+            lines.append(f"\n{who} · ID {r['telegram_id']}\n↳ {r['answer_text'][:350]}")
+        text = "\n".join(lines)
+        for start in range(0, len(text), 3500):
+            await bot.send_message(query.from_user.id, text[start:start+3500])
+    elif action == "delete":
+        await bot.send_message(query.from_user.id, "⚠️ Спробувати видалити надіслані повідомлення? Telegram зазвичай дозволяє це лише протягом 48 годин.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🗑 Так, видалити", callback_data=f"fm:delconfirm:{fid}")],
+            [InlineKeyboardButton(text="Ні", callback_data=f"fm:view:{fid}")]]))
+    elif action == "delconfirm":
+        await db_pool.execute("UPDATE bot_forms SET status='cancelled',stopped_at=now() WHERE id=$1", fid)
+        rows = await db_pool.fetch("SELECT telegram_id,message_id FROM bot_form_deliveries WHERE form_id=$1 AND status='sent' AND message_id IS NOT NULL", fid)
+        deleted = 0
+        for r in rows:
+            try:
+                await bot.delete_message(r['telegram_id'], r['message_id'])
+                await db_pool.execute("UPDATE bot_form_deliveries SET status='deleted' WHERE form_id=$1 AND telegram_id=$2", fid, r['telegram_id'])
+                deleted += 1
+            except Exception:
+                pass
+            await asyncio.sleep(0.05)
+        await bot.send_message(query.from_user.id, f"🗑 Видалено {deleted} із {len(rows)} повідомлень. Відповіді в базі збережені.")
+
+
+@dp.callback_query(F.data.startswith("fa:"))
+async def form_answer_callback(query: CallbackQuery):
+    if not db_pool:
+        await query.answer("Тимчасово недоступно", show_alert=True)
+        return
+    _, fid_s, selection = query.data.split(":", 2)
+    fid = int(fid_s)
+    row = await form_get(fid)
+    if not row or row['status'] not in ('active', 'sending'):
+        await query.answer("Опитування завершене", show_alert=True)
+        return
+    if selection == 't':
+        form_text_waiting[query.from_user.id] = fid
+        await query.answer()
+        await bot.send_message(query.from_user.id, f"✍️ Напиши свою відповідь на запитання:\n\n{row['question']}\n\nДля скасування напиши «Скасувати».")
+        return
+    options = row['options']
+    if isinstance(options, str):
+        options = json.loads(options)
+    try:
+        answer = str(options[int(selection)])
+    except (IndexError, ValueError):
+        await query.answer("Невідомий варіант", show_alert=True)
+        return
+    await db_pool.execute("""INSERT INTO bot_form_answers(form_id,telegram_id,answer_type,answer_text)
+        VALUES($1,$2,'choice',$3) ON CONFLICT(form_id,telegram_id) DO UPDATE SET
+        answer_type='choice',answer_text=excluded.answer_text,answered_at=now()""", fid, query.from_user.id, answer)
+    await query.answer("Відповідь збережена!", show_alert=True)
+
+
+
+# ==================================================
 # MAIN
 # ==================================================
 
@@ -2886,6 +3160,14 @@ async def main():
     )
 
     await init_database()
+    if db_pool:
+        try:
+            pending = await db_pool.fetch("SELECT id FROM bot_forms WHERE status='sending'")
+            for record in pending:
+                fid = record['id']
+                form_sending_tasks[fid] = asyncio.create_task(form_broadcast(fid))
+        except Exception as exc:
+            print(f"FORMS RECOVERY ERROR: {exc}", flush=True)
 
     loaded = await load_gtfs()
 
@@ -2905,7 +3187,7 @@ async def main():
         await dp.start_polling(
             bot,
             allowed_updates=[
-                "message"
+                "message", "callback_query"
             ],
         )
     finally:
