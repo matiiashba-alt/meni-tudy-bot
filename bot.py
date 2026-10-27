@@ -226,6 +226,8 @@ async def get_admin_stats():
             row = await conn.fetchrow("""
                 SELECT
                     (SELECT count(*) FROM bot_users) AS total_users,
+                    (SELECT count(*) FROM bot_users WHERE is_blocked = true) AS blocked_users,
+                    (SELECT count(*) FROM bot_users WHERE is_blocked = false) AS eligible_users,
                     (SELECT count(*) FROM bot_users WHERE last_seen >= date_trunc('day', now())) AS active_today,
                     (SELECT count(*) FROM bot_users WHERE first_seen >= date_trunc('day', now())) AS new_today,
                     (SELECT count(*) FROM bot_users WHERE first_seen >= now() - interval '7 days') AS new_7,
@@ -2299,6 +2301,8 @@ async def admin_statistics_handler(message: Message):
     await message.answer(
         "📊 СТАТИСТИКА\n━━━━━━━━━━━━━━\n\n"
         f"👥 Усього користувачів: {stats['total_users']}\n"
+        f"📨 Доступні для розсилок: {stats['eligible_users']}\n"
+        f"🚫 Заблокували бота: {stats['blocked_users']}\n"
         f"🟢 Активні сьогодні: {stats['active_today']}\n"
         f"🆕 Нові сьогодні: {stats['new_today']}\n"
         f"📅 Нові за 7 днів: {stats['new_7']}\n"
@@ -2986,7 +2990,16 @@ async def form_show(chat_id, form_id):
         await bot.send_message(chat_id, "Форму не знайдено.")
         return
     count = await db_pool.fetchval("SELECT count(*) FROM bot_form_answers WHERE form_id=$1", form_id)
-    sent = await db_pool.fetchval("SELECT count(*) FROM bot_form_deliveries WHERE form_id=$1 AND status='sent'", form_id)
+    delivery_stats = await db_pool.fetchrow("""SELECT
+        count(*) FILTER (WHERE status IN ('sent', 'deleted')) AS delivered,
+        count(*) FILTER (WHERE status = 'failed') AS failed,
+        count(*) FILTER (WHERE status = 'deleted') AS deleted
+        FROM bot_form_deliveries WHERE form_id=$1""", form_id)
+    sent = delivery_stats['delivered']
+    failed = delivery_stats['failed']
+    deleted = delivery_stats['deleted']
+    eligible = await db_pool.fetchval("SELECT count(*) FROM bot_users WHERE is_blocked=false")
+    blocked = await db_pool.fetchval("SELECT count(*) FROM bot_users WHERE is_blocked=true")
     opts = form['options']
     if isinstance(opts, str):
         opts = json.loads(opts)
@@ -3018,6 +3031,9 @@ async def form_broadcast(form_id):
                 await db_pool.execute("INSERT INTO bot_form_deliveries(form_id,telegram_id,status) VALUES($1,$2,'failed') ON CONFLICT(form_id,telegram_id) DO UPDATE SET status='failed'", form_id, uid)
             except Exception as exc:
                 print(f"FORM SEND {form_id} {uid}: {exc}", flush=True)
+                await db_pool.execute("""INSERT INTO bot_form_deliveries(form_id,telegram_id,status)
+                    VALUES($1,$2,'failed') ON CONFLICT(form_id,telegram_id)
+                    DO UPDATE SET status='failed'""", form_id, uid)
             await asyncio.sleep(0.075)
         await db_pool.execute("UPDATE bot_forms SET status='active' WHERE id=$1 AND status='sending'", form_id)
         await bot.send_message(ADMIN_ID, f"📨 Розсилку форми #{form_id} завершено або зупинено.")
